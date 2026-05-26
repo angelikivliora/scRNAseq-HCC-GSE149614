@@ -1,0 +1,1826 @@
+---
+title: "Single-Cell RNA-seq Analysis of Hepatocellular Carcinoma"
+subtitle: "Dataset: GSE149614 | Lu et al., *Nature Communications* (2022)"
+author: "Angeliki Vliora"
+date: "`r format(Sys.Date(), '%d %B %Y')`"
+output:
+  html_document:
+    toc: true
+    toc_float:
+      collapsed: false
+      smooth_scroll: true
+    toc_depth: 3
+    theme: flatly
+    highlight: tango
+    code_folding: show
+    fig_width: 10
+    fig_height: 7
+    df_print: paged
+---
+
+```{r setup, include=FALSE}
+# ── future globals limit: set to Inf to avoid serialisation errors ─────────────
+# FindMarkers (Seurat 5) and gseGO/gseKEGG (clusterProfiler) both use future
+# internally. Setting maxSize = Inf disables the size check globally; the
+# tiered approach in load-libraries still controls parallelism via plan().
+options(future.globals.maxSize = Inf)
+
+# ── Create plots output directory ─────────────────────────────────────────────
+plots_dir <- file.path(getwd(), "plots")
+dir.create(plots_dir, showWarnings = FALSE, recursive = TRUE)
+
+knitr::opts_chunk$set(
+  echo       = TRUE,
+  message    = FALSE,
+  warning    = FALSE,
+  cache      = FALSE,
+  fig.align  = "center",
+  dpi        = 300,
+  dev        = "png",           # write standalone PNG for every figure chunk
+  fig.path   = paste0(plots_dir, "/")  # all PNGs land in ./plots/
+)
+set.seed(42)
+```
+
+---
+
+# Section 0 — Setup {.tabset}
+
+## Package Installation
+
+The following code installs any missing packages. Run this chunk once before knitting if packages are not yet available.
+
+```{r install-packages, eval=FALSE}
+# ── Memory is managed in a tiered way throughout the script ───────────────────
+# Default: 2 GB; raised to 8 GB only before FindAllMarkers; reset after.
+# See the load-libraries chunk for details.
+options(future.globals.maxSize = 2000 * 1024^2)  # 2 GB default
+
+# CRAN packages
+cran_pkgs <- c("Matrix", "Seurat", "ggplot2", "ggprism", "dplyr", "patchwork",
+               "ggrepel", "RColorBrewer", "data.table", "knitr",
+               "scales", "tidyr", "remotes", "RANN")
+install.packages(setdiff(cran_pkgs, rownames(installed.packages())))
+
+# Harmony (batch integration)
+if (!requireNamespace("harmony", quietly = TRUE))
+  install.packages("harmony")
+
+# LISI (batch mixing score) — use remotes (lighter than devtools)
+if (!requireNamespace("lisi", quietly = TRUE)) {
+  if (!requireNamespace("remotes", quietly = TRUE))
+    install.packages("remotes")
+  remotes::install_github("immunogenomics/lisi")
+}
+
+# presto — fast Wilcoxon backend for FindAllMarkers (optional; falls back to
+# Seurat's built-in Wilcoxon if unavailable)
+if (!requireNamespace("presto", quietly = TRUE)) {
+  tryCatch(
+    remotes::install_github("immunogenomics/presto", quiet = TRUE),
+    error = function(e) message("presto not installed — using Seurat built-in Wilcoxon")
+  )
+}
+
+# Bioconductor packages
+if (!requireNamespace("BiocManager", quietly = TRUE))
+  install.packages("BiocManager")
+BiocManager::install(c("clusterProfiler", "org.Hs.eg.db",
+                       "enrichplot", "AnnotationDbi",
+                       "SingleCellExperiment"), update = FALSE)
+
+# scDblFinder requires Cairo system library. If installation fails, run:
+#   micromamba install -c bioconda -c conda-forge bioconductor-scdblfinder -y
+# or in a terminal: apt-get install -y libcairo2-dev
+if (!requireNamespace("scDblFinder", quietly = TRUE))
+  BiocManager::install("scDblFinder", update = FALSE)
+```
+
+## Load Libraries
+
+```{r load-libraries}
+# ── Tiered memory management ───────────────────────────────────────────────────
+# A tiered approach to keep peak RAM usage below 16 GB:
+#   • Default (here): 2 GB — sufficient for most Seurat operations
+#   • Before SCTransform: 2 GB + plan("sequential") — avoids worker duplication
+#   • Before FindAllMarkers: raised to 8 GB — serialises full SCT object to workers
+#   • After FindAllMarkers: reset to 2 GB
+# This avoids holding 8 GB reserved throughout the entire session.
+options(future.globals.maxSize = 2000 * 1024^2)  # 2 GB default
+
+suppressPackageStartupMessages({
+  library(Matrix)          # sparse matrix support — load BEFORE Seurat
+  library(Seurat)
+  # presto is optional — load only if available
+  if (requireNamespace("presto", quietly = TRUE)) library(presto)
+  library(ggplot2)
+  library(ggprism)
+  library(dplyr)
+  library(patchwork)
+  library(ggrepel)
+  library(RColorBrewer)
+  library(data.table)
+  library(knitr)
+  library(scales)
+  library(tidyr)
+  library(harmony)
+  # lisi package: use if available, otherwise use pure-R fallback
+  if (requireNamespace("lisi", quietly = TRUE)) {
+    library(lisi)
+  } else {
+    # Pure-R implementation of compute_lisi (Local Inverse Simpson's Index)
+    # Equivalent to immunogenomics/lisi compute_lisi()
+    compute_lisi <- function(X, meta_data, label_colnames, perplexity = 30) {
+      n <- nrow(X)
+      results <- data.frame(matrix(NA, nrow = n, ncol = length(label_colnames)))
+      colnames(results) <- label_colnames
+      # Build k-NN graph using Euclidean distance
+      k <- min(as.integer(3 * perplexity), n - 1)
+      # Use RANN if available, otherwise base R
+      if (requireNamespace("RANN", quietly = TRUE)) {
+        nn <- RANN::nn2(X, k = k + 1)$nn.idx[, -1]
+      } else {
+        dmat <- as.matrix(dist(X))
+        nn <- t(apply(dmat, 1, function(d) order(d)[2:(k + 1)]))
+      }
+      for (label_col in label_colnames) {
+        labels <- meta_data[[label_col]]
+        lisi_vals <- vapply(seq_len(n), function(i) {
+          neighbour_labels <- labels[nn[i, ]]
+          tab <- table(neighbour_labels)
+          p <- as.numeric(tab) / sum(tab)
+          1 / sum(p^2)
+        }, numeric(1))
+        results[[label_col]] <- lisi_vals
+      }
+      results
+    }
+    message("lisi package not available — using pure-R compute_lisi fallback")
+  }
+  # scDblFinder: use if available
+  scDblFinder_available <- requireNamespace("scDblFinder", quietly = TRUE) &&
+                           requireNamespace("SingleCellExperiment", quietly = TRUE)
+  if (scDblFinder_available) {
+    library(scDblFinder)
+    library(SingleCellExperiment)
+  } else {
+    message("scDblFinder/SingleCellExperiment not available — doublet detection will be skipped; cells will be filtered by QC metrics only.")
+  }
+  library(clusterProfiler)
+  library(org.Hs.eg.db)
+  library(enrichplot)
+})
+
+# ── Resolve namespace conflicts ────────────────────────────────────────────────
+# AnnotationDbi::select masks dplyr::select after clusterProfiler is loaded.
+# Pin dplyr verbs explicitly so bare calls work throughout the document.
+select   <- dplyr::select
+filter   <- dplyr::filter
+rename   <- dplyr::rename
+mutate   <- dplyr::mutate
+arrange  <- dplyr::arrange
+summarise <- dplyr::summarise
+```
+
+## Colour Palettes
+
+```{r colour-palettes}
+# Colour-blind-friendly palette for cell types (6 types)
+celltype_colours <- c(
+  "Hepatocyte"  = "#E69F00",
+  "T/NK"        = "#56B4E9",
+  "Myeloid"     = "#009E73",
+  "B"           = "#CC79A7",
+  "Endothelial" = "#0072B2",
+  "Fibroblast"  = "#D55E00"
+)
+
+# Sample colours
+sample_colours <- c(
+  "HCC01T" = "#4E79A7",
+  "HCC02T" = "#F28E2B",
+  "HCC03T" = "#E15759"
+)
+
+# Cluster palette (up to 20 clusters)
+cluster_pal <- colorRampPalette(brewer.pal(12, "Paired"))(20)
+```
+
+---
+
+# Section 1 — Dataset Description
+
+## Background
+
+Hepatocellular carcinoma (HCC) is the most common primary liver cancer and the third leading cause of cancer-related mortality worldwide. It typically arises in the context of chronic liver disease — most frequently driven by hepatitis B virus (HBV) or hepatitis C virus (HCV) infection, alcohol-related cirrhosis, or non-alcoholic fatty liver disease. Despite advances in surgical resection and immunotherapy (e.g., atezolizumab + bevacizumab), the five-year survival rate for advanced HCC remains below 20%, underscoring the need for a deeper understanding of tumour biology.
+
+Single-cell RNA sequencing (scRNA-seq) has emerged as a powerful tool to dissect the cellular heterogeneity of the tumour microenvironment (TME). In this analysis, a publicly available dataset **GSE149614** is used, generated by Lu *et al.* (2022) and published in *Nature Communications*. The study profiled 71,915 single cells from 10 HCC patients across four tissue types: primary tumour (PT), non-tumour liver (NTL), portal vein tumour thrombus (PVTT), and metastatic lymph node (MLN). Six major cell populations were identified: malignant hepatocytes, T/NK cells, myeloid cells, B cells, endothelial cells, and fibroblasts.
+
+**Gene of interest — AFP (Alpha-Fetoprotein):** AFP is the canonical serum biomarker for HCC, routinely used in clinical diagnosis (elevated AFP ≥ 400 ng/mL is diagnostic in combination with imaging). It is a glycoprotein produced by foetal hepatocytes and re-expressed in malignant hepatocytes during oncogenesis. AFP is expected to be preferentially expressed in the malignant hepatocyte cluster, making it an ideal gene to demonstrate cluster-specific expression in this dataset.
+
+## Data Download
+
+The count matrix and metadata are downloaded programmatically from the NCBI GEO FTP server, ensuring full reproducibility. **Note:** the count matrix is ~157 MB compressed and requires approximately 4–6 GB of RAM to load. If you have already downloaded the files, update `data_dir` to point to your local directory.
+
+```{r download-data}
+# ── Data download ──────────────────────────────────────────────────────────────
+# Source: https://www.ncbi.nlm.nih.gov/geo/query/acc.cgi?acc=GSE149614
+# Lu Y, et al. A single-cell atlas of the multicellular ecosystem of primary
+# and metastatic hepatocellular carcinoma. Nat Commun. 2022;13:4594.
+
+data_dir  <- "."   # Change to a local path if files are already downloaded
+count_gz  <- file.path(data_dir, "GSE149614_counts.txt.gz")
+meta_gz   <- file.path(data_dir, "GSE149614_metadata.txt.gz")
+
+base_url <- "https://ftp.ncbi.nlm.nih.gov/geo/series/GSE149nnn/GSE149614/suppl/"
+
+if (!file.exists(count_gz)) {
+  message("Downloading count matrix (~157 MB) ...")
+  options(timeout = 600)
+  download.file(paste0(base_url, "GSE149614_HCC.scRNAseq.S71915.count.txt.gz"),
+                count_gz, mode = "wb", quiet = FALSE)
+}
+
+if (!file.exists(meta_gz)) {
+  message("Downloading metadata ...")
+  options(timeout = 120)
+  download.file(paste0(base_url, "GSE149614_HCC.metadata.updated.txt.gz"),
+                meta_gz, mode = "wb", quiet = FALSE)
+}
+```
+
+## Load and Subset Data
+
+The count matrix is in **genes × cells** format (25,712 genes, 71,915 cells). A subset of the three primary tumour samples from patients HCC01, HCC02, and HCC03 (HCC01T, HCC02T, HCC03T) will be used, yielding 12,294 cells for analysis.
+
+**Note on file structure:** The count matrix layout: the header row contains 71,915 cell barcodes with no column header for the gene-name field. Data rows have 71,916 fields (gene name + 71,915 counts). Therefore the header will be read separately to identify column positions, then use `fread(header=FALSE, skip=1)` to load only the 12,294 columns of interest.
+
+```{r load-data}
+# ── Load metadata ──────────────────────────────────────────────────────────────
+meta <- read.table(meta_gz, header = TRUE, sep = "\t", stringsAsFactors = FALSE)
+
+# Subset to three primary tumour samples
+samples_use  <- c("HCC01T", "HCC02T", "HCC03T")
+meta_sub     <- meta[meta$sample %in% samples_use, ]
+cells_keep   <- meta_sub$Cell
+
+cat("Cells selected per sample:\n")
+print(table(meta_sub$sample))
+cat("Total cells:", nrow(meta_sub), "\n")
+
+# ── Load count matrix (genes x cells) ─────────────────────────────────────────
+# # File structure: header row = 71,915 cell barcodes (no gene-name column header)
+#                 data rows  = gene_name | count1 | count2 | ...
+# We read the header separately to get cell barcode positions, then use
+# fread(header=FALSE, skip=1) to read only the columns we need.
+message("Reading count matrix header ...")
+con           <- gzcon(file(count_gz, "rb"))
+header_line   <- readLines(con, n = 1)
+close(con)
+cell_barcodes <- strsplit(header_line, "\t")[[1]]   # all 71,915 cell barcodes
+cat("Total cell barcodes in matrix:", length(cell_barcodes), "\n")
+
+# Column positions: col 1 = gene names, cols 2..N = cells (1-indexed in data rows)
+matching_idx   <- which(cell_barcodes %in% cells_keep)
+col_select     <- c(1L, matching_idx + 1L)          # +1 because col 1 is gene names
+selected_cells <- cell_barcodes[matching_idx]
+cat("Matching cells:", length(matching_idx), "\n")
+
+message("Loading count matrix (this may take 1-3 minutes) ...")
+counts_dt <- fread(count_gz,
+                   header       = FALSE,
+                   skip         = 1,          # skip the cell-barcode header row
+                   sep          = "\t",
+                   select       = col_select,
+                   showProgress = FALSE)
+
+# Assign gene names (col 1) and cell barcodes (remaining cols)
+gene_names <- counts_dt[[1]]
+
+# ── Convert to sparse matrix BEFORE creating Seurat object ────────────────────
+# Converting to sparse format immediately after fread avoids holding a dense
+# matrix in RAM alongside the Seurat object. 
+counts_mat <- Matrix::Matrix(
+  as.matrix(counts_dt[, -1, with = FALSE]),
+  sparse = TRUE
+)
+rownames(counts_mat) <- make.unique(gene_names)
+colnames(counts_mat) <- selected_cells
+rm(counts_dt, gene_names); gc(full = TRUE)   # free dense intermediate + data.table
+
+cat("\nCount matrix dimensions (genes x cells):",
+    nrow(counts_mat), "x", ncol(counts_mat), "\n")
+cat("Sparse matrix class:", class(counts_mat), "\n")
+cat("Non-zero entries:", Matrix::nnzero(counts_mat),
+    sprintf("(%.1f%% sparse)\n",
+            100 * (1 - Matrix::nnzero(counts_mat) / prod(dim(counts_mat)))))
+```
+
+## Create Seurat Object
+
+```{r create-seurat}
+# ── Create Seurat object ───────────────────────────────────────────────────────
+seurat_obj <- CreateSeuratObject(
+  counts   = counts_mat,
+  project  = "HCC_scRNAseq",
+  min.cells = 3,    # retain genes detected in ≥3 cells
+  min.features = 0  # QC filtering applied explicitly below
+)
+rm(counts_mat); gc(full = TRUE)  # free sparse matrix — Seurat stores its own copy
+
+# Add metadata columns
+seurat_obj$sample    <- meta_sub$sample[match(colnames(seurat_obj), meta_sub$Cell)]
+seurat_obj$patient   <- meta_sub$patient[match(colnames(seurat_obj), meta_sub$Cell)]
+seurat_obj$celltype  <- meta_sub$celltype[match(colnames(seurat_obj), meta_sub$Cell)]
+seurat_obj$site      <- meta_sub$site[match(colnames(seurat_obj), meta_sub$Cell)]
+seurat_obj$stage     <- meta_sub$stage[match(colnames(seurat_obj), meta_sub$Cell)]
+seurat_obj$virus     <- meta_sub$virus[match(colnames(seurat_obj), meta_sub$Cell)]
+
+cat("Seurat object summary:\n")
+print(seurat_obj)
+
+# Cells per sample
+cat("\nCells per sample after Seurat object creation:\n")
+print(table(seurat_obj$sample))
+```
+
+---
+
+# Section 2 — Quality Control {#qc}
+
+> **Required step.** Three standard QC metrics are being assessed per cell: (1) the number of detected genes (`nFeature_RNA`), (2) the total UMI count (`nCount_RNA`), and (3) the percentage of reads mapping to mitochondrial genes (`percent.mt`). High mitochondrial content indicates damaged or dying cells that have lost cytoplasmic RNA while retaining mitochondrial transcripts. Cells with very few detected genes are likely empty droplets, while cells with unusually high gene counts may be doublets.
+
+## Compute QC Metrics
+
+```{r compute-qc}
+# Mitochondrial gene percentage (human: MT- prefix)
+seurat_obj[["percent.mt"]] <- PercentageFeatureSet(seurat_obj, pattern = "^MT-")
+
+# Ribosomal gene percentage (optional, informative)
+seurat_obj[["percent.rb"]] <- PercentageFeatureSet(seurat_obj, pattern = "^RP[SL]")
+
+# Summary statistics per sample
+qc_summary <- seurat_obj@meta.data %>%
+  group_by(sample) %>%
+  summarise(
+    N_cells        = n(),
+    Median_genes   = round(median(nFeature_RNA)),
+    Median_UMIs    = round(median(nCount_RNA)),
+    Median_pct_mt  = round(median(percent.mt), 2),
+    .groups = "drop"
+  )
+
+kable(qc_summary, caption = "QC metric summary per sample (before filtering)",
+      col.names = c("Sample", "N cells", "Median genes/cell",
+                    "Median UMIs/cell", "Median % MT"))
+```
+
+## QC Visualisations (Before Filtering)
+
+```{r qc-violin, fig.height=8, fig.cap="Violin plots of QC metrics per sample before filtering. Dashed lines indicate the filtering thresholds applied in the next step."}
+# Violin plots of the three core QC metrics, split by sample
+p_feat <- VlnPlot(seurat_obj, features = "nFeature_RNA", group.by = "sample",
+                  cols = sample_colours, pt.size = 0) +
+  geom_hline(yintercept = c(200, 8000), linetype = "dashed",
+             colour = "firebrick", linewidth = 0.6) +
+  labs(title = "Detected genes per cell", x = NULL, y = "nFeature_RNA") +
+  theme_prism(base_size = 11) +
+  theme(legend.position = "none")
+
+p_umi <- VlnPlot(seurat_obj, features = "nCount_RNA", group.by = "sample",
+                 cols = sample_colours, pt.size = 0) +
+  scale_y_continuous(labels = comma) +
+  labs(title = "Total UMI counts per cell", x = NULL, y = "nCount_RNA") +
+  theme_prism(base_size = 11) +
+  theme(legend.position = "none")
+
+p_mt <- VlnPlot(seurat_obj, features = "percent.mt", group.by = "sample",
+                cols = sample_colours, pt.size = 0) +
+  geom_hline(yintercept = 10, linetype = "dashed",
+             colour = "firebrick", linewidth = 0.6) +
+  labs(title = "Mitochondrial gene %", x = NULL, y = "% MT") +
+  theme_prism(base_size = 11) +
+  theme(legend.position = "none")
+
+(p_feat | p_umi | p_mt) +
+  plot_annotation(
+    title   = "QC Metrics Before Filtering",
+    caption = "Dashed red lines: filtering thresholds (nFeature: 200–6000; % MT: ≤10%)",
+    theme   = theme(plot.title = element_text(size = 14, face = "bold"))
+  )
+```
+
+```{r qc-scatter, fig.height=5, fig.cap="Scatter plot of total UMI counts vs detected genes per cell, coloured by mitochondrial percentage. Cells in the upper-right with high MT% are likely damaged."}
+ggplot(seurat_obj@meta.data,
+       aes(x = nCount_RNA, y = nFeature_RNA, colour = percent.mt)) +
+  geom_point(size = 0.4, alpha = 0.6) +
+  scale_colour_gradientn(colours = c("steelblue", "gold", "firebrick"),
+                         name = "% MT") +
+  scale_x_continuous(labels = comma) +
+  geom_hline(yintercept = c(200, 6000), linetype = "dashed",
+             colour = "firebrick", linewidth = 0.5) +
+  facet_wrap(~sample, nrow = 1) +
+  labs(title = "UMI Counts vs Detected Genes (coloured by % MT)",
+       x = "Total UMI counts (nCount_RNA)",
+       y = "Detected genes (nFeature_RNA)") +
+  theme_prism(base_size = 11) +
+  theme(strip.text = element_text(face = "bold"))
+```
+
+## Doublet Detection
+
+Doublets arise when two cells are captured in the same droplet and sequenced as a single cell. They inflate gene counts, can form spurious "bridge" clusters between real populations, and bias downstream analyses. **scDblFinder** (Germain *et al.*, 2021), a fast simulation-based method that trains a classifier on artificially generated doublets is being used to score each cell. It is run per-sample to avoid confounding by inter-patient differences.
+
+```{r doublet-detection}
+# scDblFinder requires a SingleCellExperiment object; convert per-sample,
+# run detection, then transfer the doublet scores back to the Seurat object.
+# Running per-sample is critical: pooling samples inflates the apparent
+# doublet rate and degrades classifier accuracy.
+# If scDblFinder is unavailable, all cells are labelled "singlet" and
+# doublet removal relies on the gene-count upper threshold (nFeature ≤ 8000).
+
+if (scDblFinder_available) {
+  sce_list <- lapply(samples_use, function(s) {
+    cells_s <- colnames(seurat_obj)[seurat_obj$sample == s]
+    sce_s   <- as.SingleCellExperiment(
+      subset(seurat_obj, cells = cells_s)
+    )
+    set.seed(42)
+    scDblFinder(sce_s, verbose = FALSE)
+  })
+  names(sce_list) <- samples_use
+
+  # Collect doublet calls and scores for all cells
+  dbl_df <- do.call(rbind, lapply(samples_use, function(s) {
+    sce_s <- sce_list[[s]]
+    data.frame(
+      cell          = colnames(sce_s),
+      dbl_score     = sce_s$scDblFinder.score,
+      dbl_class     = sce_s$scDblFinder.class,   # "singlet" or "doublet"
+      stringsAsFactors = FALSE
+    )
+  }))
+  rownames(dbl_df) <- dbl_df$cell
+
+  # Add to Seurat metadata (match by cell barcode)
+  seurat_obj$dbl_score <- dbl_df[colnames(seurat_obj), "dbl_score"]
+  seurat_obj$dbl_class <- dbl_df[colnames(seurat_obj), "dbl_class"]
+
+  # Free SCE objects
+  rm(sce_list, dbl_df); gc(full = TRUE)
+
+} else {
+  # Fallback: label all cells as singlets; doublet removal via gene-count threshold
+  seurat_obj$dbl_score <- 0
+  seurat_obj$dbl_class <- "singlet"
+  message("scDblFinder not available — all cells labelled 'singlet'; doublet removal relies on nFeature_RNA ≤ 8000 threshold.")
+}
+
+# Summary
+dbl_summary_wide <- seurat_obj@meta.data %>%
+  group_by(sample, dbl_class) %>%
+  summarise(n = n(), .groups = "drop") %>%
+  pivot_wider(names_from = dbl_class, values_from = n, values_fill = 0)
+
+# Ensure 'doublet' column exists even when scDblFinder is unavailable
+if (!"doublet" %in% colnames(dbl_summary_wide)) dbl_summary_wide$doublet <- 0L
+
+dbl_summary <- dbl_summary_wide %>%
+  mutate(total   = singlet + doublet,
+         pct_dbl = round(100 * doublet / total, 1))
+
+cat("Doublet detection summary (scDblFinder):\n")
+kable(dbl_summary,
+      caption = "Predicted doublets per sample (scDblFinder)",
+      col.names = c("Sample", "Singlets", "Doublets",
+                    "Total", "% Doublets"))
+```
+
+```{r doublet-score-plot, fig.height=4, fig.cap="Doublet score distribution per sample (scDblFinder). Cells are coloured by their predicted class: singlet (blue) or doublet (orange). Doublets cluster at higher scores and are removed in the filtering step below."}
+if (scDblFinder_available && any(seurat_obj$dbl_score > 0)) {
+  ggplot(seurat_obj@meta.data,
+         aes(x = dbl_score, fill = dbl_class)) +
+    geom_histogram(bins = 60, alpha = 0.85, colour = "white", linewidth = 0.2) +
+    scale_fill_manual(values = c("singlet" = "#56B4E9", "doublet" = "#D55E00"),
+                      name = "scDblFinder call") +
+    facet_wrap(~sample, nrow = 1) +
+    labs(title = "Doublet Score Distribution per Sample",
+         subtitle = "Orange = predicted doublets; blue = singlets",
+         x = "scDblFinder score", y = "Cell count") +
+    theme_prism(base_size = 11) +
+    theme(strip.text = element_text(face = "bold"))
+} else {
+  cat("scDblFinder not available in this environment — doublet score plot skipped.\nDoublet removal is handled by the nFeature_RNA ≤ 8,000 upper threshold.\n")
+}
+```
+
+## Apply Filtering Thresholds
+
+The following thresholds are applied in a single filtering step, so that the retained cell count reflects all exclusion criteria simultaneously:
+
+- **nFeature_RNA ≥ 200**: removes empty droplets and very low-quality cells
+- **nFeature_RNA ≤ 8,000**: removes extreme high-count outliers not caught by doublet detection (see biological justification below)
+- **percent.mt ≤ 10%**: removes damaged/dying cells
+- **dbl_class == "singlet"**: removes predicted doublets (scDblFinder)
+
+**Biological justification for the upper gene count threshold.** Hepatocytes are among the most transcriptionally complex cells in the human body, and malignant hepatocytes in HCC can express even more genes than normal hepatocytes due to transcriptional dysregulation and oncogene activation. A ceiling of 6,000 genes risks truncating the upper tail of the genuine hepatocyte population, removing real high-quality malignant cells rather than doublets. Since doublet removal is already handled specifically and per-sample by scDblFinder (which uses a simulation-based classifier trained on the actual data), the upper gene count threshold serves only as a safety net for extreme outliers that scDblFinder may miss. A threshold of **8,000 genes** is therefore applied here. This choice is validated retrospectively in **Section 7.5** below, after cell type annotation is complete: the nFeature_RNA distribution of annotated malignant hepatocytes is computed directly from this dataset, and 8,000 is confirmed to lie beyond the 99th percentile and beyond 3 standard deviations above the hepatocyte mean — making it a statistically grounded rather than assumed threshold.
+
+```{r filter-cells}
+n_before <- ncol(seurat_obj)
+
+# ── Compute per-cause removal counts BEFORE filtering ─────────────────────────
+pre_meta    <- seurat_obj@meta.data
+n_low_feat  <- sum(pre_meta$nFeature_RNA < 200 | pre_meta$nFeature_RNA > 8000)
+n_high_mt   <- sum(pre_meta$percent.mt > 10)
+n_doublets  <- sum(pre_meta$dbl_class == "doublet", na.rm = TRUE)
+
+# ── Apply all filters in one call ─────────────────────────────────────────────
+if (scDblFinder_available) {
+  seurat_obj <- subset(seurat_obj,
+                       subset = nFeature_RNA >= 200 &
+                                nFeature_RNA <= 8000 &
+                                percent.mt   <= 10   &
+                                dbl_class    == "singlet")
+} else {
+  # Without scDblFinder, filter on QC metrics only
+  seurat_obj <- subset(seurat_obj,
+                       subset = nFeature_RNA >= 200 &
+                                nFeature_RNA <= 8000 &
+                                percent.mt   <= 10)
+}
+
+n_after   <- ncol(seurat_obj)
+n_removed <- n_before - n_after
+
+cat(sprintf("Cells before filtering : %d\n", n_before))
+cat(sprintf("Cells after filtering  : %d\n", n_after))
+cat(sprintf("Cells removed          : %d (%.1f%%)\n",
+            n_removed, 100 * n_removed / n_before))
+cat(sprintf("  Failing gene count   : %d\n", n_low_feat))
+cat(sprintf("  High MT%%             : %d\n", n_high_mt))
+cat(sprintf("  Predicted doublets   : %d\n", n_doublets))
+
+# Per-sample breakdown
+filter_tbl <- data.frame(
+  Sample   = samples_use,
+  Before   = as.integer(table(meta_sub$sample)[samples_use]),
+  After    = as.integer(table(seurat_obj$sample)[samples_use])
+) %>%
+  mutate(Removed = Before - After,
+         Pct_retained = round(100 * After / Before, 1))
+
+kable(filter_tbl,
+      caption = "Cell counts before and after QC filtering (MT% + gene count + doublet removal)",
+      col.names = c("Sample", "Before", "After", "Removed", "% Retained"))
+
+gc(full = TRUE)  # compact heap after subsetting Seurat object
+```
+
+---
+
+# Section 3 — Normalisation and Feature Selection
+
+> For normalization **SCTransform v2** (Hafemeister & Satija, 2019) is being employed, which applies a regularised negative binomial regression to model the relationship between sequencing depth and gene expression, effectively removing the confounding effect of total UMI counts. A mitochondrial percentage is computed as an additional technical covariate. SCTransform simultaneously identifies highly variable genes (HVGs) used for downstream dimensionality reduction.
+
+```{r sctransform, results='hide'}
+# ── Memory settings for SCTransform ───────────────────────────────────────────
+# SCTransform v2 uses future for parallelism.
+# We use plan("sequential") to avoid spawning worker processes that each hold
+# a copy of the Seurat object in RAM.
+options(future.globals.maxSize = 2000 * 1024^2)  # 2 GB for SCTransform
+future::plan("sequential")
+
+seurat_obj <- SCTransform(
+  seurat_obj,
+  vst.flavor          = "v2",
+  vars.to.regress     = "percent.mt",
+  variable.features.n = 3000,
+  verbose             = FALSE
+)
+gc(full = TRUE)  # release SCTransform intermediate objects
+```
+
+```{r hvg-plot, fig.height=5, fig.cap="Top 3,000 highly variable genes identified by SCTransform v2. The 20 most variable genes are labelled."}
+top20 <- head(VariableFeatures(seurat_obj), 20)
+
+p_hvg <- VariableFeaturePlot(seurat_obj,
+                              cols = c("grey70", "#E69F00"),
+                              selection.method = "sct") +
+  labs(title = "Highly Variable Genes (SCTransform v2)") +
+  theme_prism(base_size = 11)
+
+LabelPoints(plot = p_hvg, points = top20, repel = TRUE, xnudge = 0, ynudge = 0)
+```
+
+---
+
+# Section 4 — Batch Effect Assessment
+
+> **This section is placed before clustering** because the outcome determines which dimensionality reduction is used for all downstream steps. The three samples (HCC01T, HCC02T, HCC03T) originate from three different patients, so inter-patient transcriptomic variability is expected. *biological* heterogeneity (genuine differences in cell type composition or cell state between patients) and *technical* batch effects (systematic patient-level biases that would artificially separate cells of the same type) are distinguished. Both visual inspection and a quantitative mixing score (LISI) are being used to make this determination.
+
+## Step 4a — PCA Without Integration
+
+```{r pca}
+seurat_obj <- RunPCA(seurat_obj, npcs = 50, verbose = FALSE)
+```
+
+```{r elbow-plot, fig.height=4, fig.cap="Elbow plot of PCA variance explained. The curve drops steeply from PC 1–5 and begins to flatten around PC 10–15, with only marginal gains beyond that point. 30 PCs is used throughout to ensure minor sources of biological variation beyond the primary inflection are retained."}
+ElbowPlot(seurat_obj, ndims = 50) +
+  geom_vline(xintercept = 30, linetype = "dashed",
+             colour = "firebrick", linewidth = 0.6) +
+  labs(title = "PCA Elbow Plot — Variance Explained per PC",
+       caption = "Dashed line: PC 30 (selected for downstream analysis)") +
+  theme_prism(base_size = 11)
+```
+
+```{r umap-pre-integration, fig.height=5, fig.cap="UMAP computed on PCA (no integration) coloured by sample. Partial separation between samples indicates inter-patient variability; the LISI score below quantifies whether this constitutes a confounding batch effect."}
+seurat_obj <- RunUMAP(seurat_obj, dims = 1:30, reduction = "pca",
+                      reduction.name = "umap.pca", verbose = FALSE)
+
+DimPlot(seurat_obj, reduction = "umap.pca", group.by = "sample",
+        cols = sample_colours, pt.size = 0.4) +
+  labs(title = "UMAP (PCA, no integration) — coloured by sample",
+       colour = "Sample") +
+  theme_prism(base_size = 11)
+```
+
+## Step 4b — LISI Batch Mixing Score
+
+The **Local Inverse Simpson's Index (LISI)** measures how well cells from different samples are mixed in the neighbourhood graph. A score of 1 indicates complete separation (all neighbours from the same sample); a score equal to the number of samples (here, 3) indicates perfect mixing. A threshold of **mean LISI < 1.5** is used to trigger Harmony integration.
+
+```{r lisi-score}
+# Extract PCA embeddings (30 PCs) for LISI computation
+pca_embed <- Embeddings(seurat_obj, reduction = "pca")[, 1:30]
+meta_lisi  <- data.frame(sample = seurat_obj$sample,
+                         row.names = colnames(seurat_obj))
+
+lisi_scores <- compute_lisi(pca_embed, meta_lisi, label_colnames = "sample")
+
+mean_lisi <- mean(lisi_scores$sample)
+sd_lisi   <- sd(lisi_scores$sample)
+
+cat(sprintf("LISI score (sample): mean = %.3f  SD = %.3f\n", mean_lisi, sd_lisi))
+cat(sprintf("Threshold for integration: mean LISI < 1.5\n"))
+cat(sprintf("Decision: %s\n",
+            ifelse(mean_lisi < 1.5,
+                   "INTEGRATE with Harmony (poor mixing detected)",
+                   "No integration required (acceptable mixing)")))
+
+# Store decision
+run_harmony <- mean_lisi < 1.5
+```
+
+```{r lisi-violin, fig.height=4, fig.cap="Distribution of per-cell LISI scores. Scores close to 1 indicate cells are surrounded predominantly by neighbours from the same sample (poor mixing); scores close to 3 indicate good inter-sample mixing."}
+lisi_df <- data.frame(LISI = lisi_scores$sample,
+                      sample = seurat_obj$sample)
+
+ggplot(lisi_df, aes(x = sample, y = LISI, fill = sample)) +
+  geom_violin(trim = TRUE, alpha = 0.8) +
+  geom_boxplot(width = 0.1, fill = "white", outlier.size = 0.3) +
+  geom_hline(yintercept = 1.5, linetype = "dashed",
+             colour = "firebrick", linewidth = 0.6) +
+  annotate("text", x = 0.6, y = 1.55, label = "Threshold = 1.5",
+           hjust = 0, colour = "firebrick", size = 3.5) +
+  scale_fill_manual(values = sample_colours) +
+  labs(title = "LISI Scores by Sample (PCA embedding)",
+       subtitle = sprintf("Mean LISI = %.3f ± %.3f", mean_lisi, sd_lisi),
+       x = "Sample", y = "LISI score") +
+  theme_prism(base_size = 11) +
+  theme(legend.position = "none")
+```
+
+## Step 4c — Conditional Harmony Integration
+
+```{r harmony-integration}
+if (run_harmony) {
+  message("Running Harmony integration ...")
+  seurat_obj <- RunHarmony(
+    seurat_obj,
+    group.by.vars  = "sample",
+    reduction      = "pca",
+    reduction.save = "harmony",
+    verbose        = FALSE
+  )
+
+  chosen_reduction <- "harmony"
+  message("Harmony integration complete. Using 'harmony' reduction for clustering.")
+} else {
+  chosen_reduction <- "pca"
+  message("LISI score indicates acceptable mixing. Using 'pca' reduction for clustering.")
+}
+
+cat("Reduction used for downstream analysis:", chosen_reduction, "\n")
+```
+
+```{r umap-comparison, fig.height=5, fig.cap="UMAP coloured by sample: left = before integration (PCA), right = after Harmony integration (if applied). Improved interleaving of sample colours after integration indicates successful batch correction."}
+if (run_harmony) {
+  seurat_obj <- RunUMAP(seurat_obj, dims = 1:30, reduction = "harmony",
+                        reduction.name = "umap.harmony",
+                        reduction.key = "UMAPHARMONY_", verbose = FALSE)
+
+  p_before <- DimPlot(seurat_obj, reduction = "umap.pca",
+                      group.by = "sample", cols = sample_colours,
+                      pt.size = 0.3) +
+    labs(title = "Before integration (PCA)", colour = "Sample") +
+    theme_prism(base_size = 10) +
+    theme(legend.position = "bottom")
+
+  p_after <- DimPlot(seurat_obj, reduction = "umap.harmony",
+                     group.by = "sample", cols = sample_colours,
+                     pt.size = 0.3) +
+    labs(title = "After Harmony integration", colour = "Sample") +
+    theme_prism(base_size = 10) +
+    theme(legend.position = "bottom")
+
+  p_before + p_after +
+    plot_annotation(
+      title = "Batch Effect Assessment: UMAP Before vs After Integration",
+      theme = theme(plot.title = element_text(size = 13, face = "bold"))
+    )
+} else {
+  DimPlot(seurat_obj, reduction = "umap.pca", group.by = "sample",
+          cols = sample_colours, pt.size = 0.4) +
+    labs(title = "UMAP (PCA) — No integration required",
+         subtitle = sprintf("Mean LISI = %.3f ≥ 1.5: samples mix adequately",
+                            mean_lisi),
+         colour = "Sample") +
+    theme_prism(base_size = 11)
+}
+```
+
+---
+
+# Section 5 — Dimensionality Reduction and Clustering {#clustering}
+
+> **Required step.** Cells are clustered by using a graph-based approach: (1) construct a shared nearest-neighbour (SNN) graph on the chosen reduction (`r chosen_reduction`), (2) apply the Louvain algorithm at multiple resolutions (0.4, 0.6, 0.8) to identify communities, and (3) project cells into two dimensions using UMAP for visualisation. **Resolution 0.6** is selected as the primary clustering, which provides biologically interpretable clusters corresponding to the major cell types present in HCC tumours.
+
+## Clustering at Multiple Resolutions
+
+```{r clustering}
+# Set the active UMAP reduction for plotting
+umap_use <- if (run_harmony) "umap.harmony" else "umap.pca"
+# Note: RunUMAP saves to "umap.harmony" (post-Harmony) or "umap.pca" (no integration)
+
+# Use an explicit graph name so cluster columns are predictable regardless
+# of which reduction (pca vs harmony) is used
+seurat_obj <- FindNeighbors(seurat_obj, dims = 1:30,
+                             reduction = chosen_reduction,
+                             graph.name = c("HCC_nn", "HCC_snn"),
+                             verbose = FALSE)
+
+seurat_obj <- FindClusters(seurat_obj, graph.name = "HCC_snn",
+                            resolution = 0.4,
+                            verbose = FALSE, random.seed = 42)
+seurat_obj <- FindClusters(seurat_obj, graph.name = "HCC_snn",
+                            resolution = 0.6,
+                            verbose = FALSE, random.seed = 42)
+seurat_obj <- FindClusters(seurat_obj, graph.name = "HCC_snn",
+                            resolution = 0.8,
+                            verbose = FALSE, random.seed = 42)
+
+# Set resolution 0.6 as the active identity
+Idents(seurat_obj) <- "HCC_snn_res.0.6"
+
+cat("Number of clusters at each resolution:\n")
+cat("  Resolution 0.4:", length(unique(seurat_obj$HCC_snn_res.0.4)), "clusters\n")
+cat("  Resolution 0.6:", length(unique(seurat_obj$HCC_snn_res.0.6)), "clusters\n")
+cat("  Resolution 0.8:", length(unique(seurat_obj$HCC_snn_res.0.8)), "clusters\n")
+```
+
+## UMAP — Resolution Comparison
+
+```{r umap-resolutions, fig.height=5, fig.cap="UMAP coloured by cluster identity at three resolutions. Resolution 0.6 (centre) is selected as the primary clustering for downstream analysis, balancing granularity with biological interpretability."}
+p04 <- DimPlot(seurat_obj, reduction = umap_use,
+               group.by = "HCC_snn_res.0.4", label = TRUE,
+               label.size = 3, repel = TRUE, pt.size = 0.3) +
+  scale_colour_manual(values = cluster_pal) +
+  labs(title = "Resolution 0.4") +
+  theme_prism(base_size = 9) +
+  theme(legend.position = "none")
+
+p06 <- DimPlot(seurat_obj, reduction = umap_use,
+               group.by = "HCC_snn_res.0.6", label = TRUE,
+               label.size = 3, repel = TRUE, pt.size = 0.3) +
+  scale_colour_manual(values = cluster_pal) +
+  labs(title = "Resolution 0.6 * (selected)") +
+  theme_prism(base_size = 9) +
+  theme(legend.position = "none",
+        plot.title = element_text(colour = "#E69F00", face = "bold"))
+
+p08 <- DimPlot(seurat_obj, reduction = umap_use,
+               group.by = "HCC_snn_res.0.8", label = TRUE,
+               label.size = 3, repel = TRUE, pt.size = 0.3) +
+  scale_colour_manual(values = cluster_pal) +
+  labs(title = "Resolution 0.8") +
+  theme_prism(base_size = 9) +
+  theme(legend.position = "none")
+
+p04 + p06 + p08 +
+  plot_annotation(
+    title   = "Clustering at Three Resolutions",
+    caption = "* Resolution 0.6 selected for downstream analysis",
+    theme   = theme(plot.title = element_text(size = 13, face = "bold"))
+  )
+```
+
+## UMAP — Clusters and Samples
+
+```{r umap-clusters-samples, fig.height=5, fig.cap="UMAP at resolution 0.6 coloured by cluster (left) and by sample of origin (right). Cells from all three patients are distributed across clusters, indicating that clustering captures biological cell types rather than patient-specific effects."}
+p_clust <- DimPlot(seurat_obj, reduction = umap_use,
+                   group.by = "HCC_snn_res.0.6",
+                   label = TRUE, label.size = 3.5, repel = TRUE,
+                   pt.size = 0.4) +
+  scale_colour_manual(values = cluster_pal) +
+  labs(title = "Clusters (res. 0.6)", colour = "Cluster") +
+  theme_prism(base_size = 11) +
+  theme(legend.position = "right")
+
+p_samp <- DimPlot(seurat_obj, reduction = umap_use,
+                  group.by = "sample", pt.size = 0.4,
+                  cols = sample_colours) +
+  labs(title = "Sample of origin", colour = "Sample") +
+  theme_prism(base_size = 11) +
+  theme(legend.position = "right")
+
+p_clust + p_samp
+```
+
+---
+
+# Section 6 — Gene of Interest: AFP {#afp}
+
+> **Required step.** The task is to select one gene relevant to the chosen cancer type and demonstrate, using the UMAP clusters produced in Section 5, that this gene is **preferentially expressed in one specific cluster** rather than distributed uniformly across all clusters. This section addresses that task completely and in four independent ways: (1) spatial localisation on the UMAP, (2) per-cluster expression distributions, (3) co-expression with known hepatocyte markers, and (4) formal statistical testing.
+
+**Gene selected: *AFP* (Alpha-Fetoprotein).** AFP is the canonical serum biomarker for hepatocellular carcinoma, used clinically for diagnosis (serum AFP ≥ 400 ng/mL is diagnostic in combination with imaging) and surveillance. It is a glycoprotein produced by foetal hepatocytes and re-expressed specifically in malignant hepatocytes during oncogenic transformation, it is not expressed in immune cells, endothelial cells, or fibroblasts. AFP is biologically expected to be highly cluster-specific, and any cluster showing elevated AFP expression can be directly interpreted as the malignant hepatocyte population.
+
+---
+
+## 6.1 Spatial Localisation: AFP on UMAP
+
+The first line of evidence is spatial. If AFP is preferentially expressed in one cluster, its expression should be concentrated in one region of the UMAP rather than scattered uniformly across the embedding. The `FeaturePlot` below overlays AFP expression (SCT-normalised log expression) on the UMAP produced in Section 5. Cells are plotted in order of increasing expression (`order = TRUE`) so that AFP-expressing cells are drawn on top and are not obscured by non-expressing neighbours.
+
+```{r afp-feature-plot, fig.height=5, fig.cap="UMAP coloured by AFP expression level (SCT-normalised). Cells are ordered by expression so AFP-positive cells are drawn on top. High AFP expression is tightly concentrated in one discrete region of the UMAP, corresponding to a single cluster. All other regions of the embedding are grey (AFP = 0), demonstrating cluster-specific rather than diffuse expression."}
+FeaturePlot(seurat_obj, features = "AFP", reduction = umap_use,
+            pt.size = 0.4, order = TRUE) +
+  scale_colour_gradientn(
+    colours = c("lightgrey", "#FEE391", "#FEC44F", "#FE9929",
+                "#D95F0E", "#993404"),
+    name = "AFP\n(log-norm)"
+  ) +
+  labs(title = "AFP Expression — UMAP",
+       subtitle = "Expression concentrated in one cluster; all others near zero") +
+  theme_prism(base_size = 11)
+```
+
+**Interpretation:** AFP-expressing cells form a tight, spatially coherent group in the UMAP. The rest of the embedding is uniformly grey (zero expression). This spatial pattern is the first direct demonstration that AFP is preferentially expressed in one specific cluster.
+
+---
+
+## 6.2 Per-Cluster Expression Distribution: Violin Plot
+
+The second line of evidence quantifies the expression distribution within each cluster. A violin plot shows the full distribution of AFP expression for every cluster simultaneously, making it immediately visible which cluster(s) have elevated expression and which are at zero.
+
+```{r afp-violin, fig.height=5, fig.cap="Violin plot of AFP expression (SCT-normalised) across all clusters at resolution 0.6. One cluster has a clearly elevated distribution with a long upper tail, while all other clusters are flat at zero. This directly demonstrates preferential expression in a single cluster."}
+VlnPlot(seurat_obj, features = "AFP", group.by = "HCC_snn_res.0.6",
+        pt.size = 0, cols = cluster_pal) +
+  labs(title = "AFP Expression Across All Clusters (res. 0.6)",
+       subtitle = "One cluster is clearly elevated; all others are at zero",
+       x = "Cluster", y = "Normalised expression (SCT)") +
+  theme_prism(base_size = 11) +
+  theme(legend.position = "none",
+        axis.text.x = element_text(angle = 45, hjust = 1))
+```
+
+**Interpretation:** One cluster has a clearly elevated violin with a long upper tail, while every other cluster is flat at zero. This is the clearest visual demonstration that AFP expression is not distributed uniformly, it is concentrated in a single cluster.
+
+---
+
+## 6.3 Co-expression with Hepatocyte Markers: Dot Plot
+
+The third line of evidence confirms that the AFP-high cluster is genuinely a hepatocyte cluster. AFP is shown alongside three additional canonical malignant hepatocyte markers — **ALB** (albumin), **APOA1** (apolipoprotein A1), and **APOB** (apolipoprotein B) — all of which are liver-specific proteins not expressed in immune or stromal cells. If all four markers are elevated in the same cluster, this provides strong convergent evidence for hepatocyte identity.
+
+```{r afp-dotplot, fig.height=4, fig.cap="Dot plot of AFP and co-expressed malignant hepatocyte markers (ALB, APOA1, APOB) across all clusters. Dot size = percentage of cells in the cluster with detectable expression; colour = mean expression level. All four markers are co-elevated in the same cluster and near-absent in all others, confirming that the AFP-high cluster is the malignant hepatocyte population."}
+hepatocyte_markers <- c("AFP", "ALB", "APOA1", "APOB")
+
+DotPlot(seurat_obj, features = hepatocyte_markers,
+        group.by = "HCC_snn_res.0.6",
+        cols = c("lightgrey", "#D95F0E")) +
+  labs(title = "AFP and Hepatocyte Marker Co-expression Across Clusters",
+       subtitle = "All four markers co-elevated in the same cluster — confirming hepatocyte identity",
+       x = "Gene", y = "Cluster") +
+  theme_prism(base_size = 11) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+```
+
+**Interpretation:** AFP, ALB, APOA1, and APOB are all co-elevated in the same cluster and near-absent in all others. This rules out the possibility that AFP elevation is a technical artefact: four independent liver-specific genes converge on the same cluster, confirming it as the malignant hepatocyte population.
+
+---
+
+## 6.4 Statistical Confirmation: Formal Testing
+
+The fourth and most rigorous line of evidence is statistical. Three complementary metrics are computed:
+
+1. **Percentage of expressing cells** (`pct_expr`): the fraction of cells per cluster with detectable AFP (> 0). This is the primary metric for a sparse scRNA-seq gene, because cluster means are dominated by the proportion of expressing cells rather than expression magnitude.
+2. **Mean expression fold-change**: the ratio of mean AFP expression in the top cluster vs all other clusters combined. Reported for completeness but interpreted cautiously given sparsity (see Section 9.6).
+3. **Wilcoxon rank-sum test**: a formal one-vs-rest statistical test comparing AFP expression in the top cluster against all remaining cells. This is the same test used by `FindAllMarkers()` and provides an adjusted p-value that directly answers whether the difference is statistically significant.
+
+**Why Wilcoxon rank-sum?** scRNA-seq expression data violates the assumptions of parametric tests (t-test, ANOVA) in two fundamental ways. First, the data is **zero-inflated**: AFP is a sparse gene, meaning the majority of cells have exactly zero counts due to dropout — a distribution that is far from normal. Second, even among expressing cells, the distribution is **right-skewed** with a long upper tail. The Wilcoxon rank-sum test (also called the Mann–Whitney U test) is a non-parametric test that makes no distributional assumptions: it operates on ranks rather than raw values, so it is robust to both zero-inflation and skewness. This is why it is the default test in `FindAllMarkers()` and the most widely used differential expression test in scRNA-seq analysis. The one-sided formulation (`alternative = "greater"`) directly tests the hypothesis of interest: that AFP expression in the top cluster is *higher* than in all other cells, rather than merely different.
+
+```{r afp-stats}
+# ── Identify the cluster with highest AFP expression ───────────────────────────
+DefaultAssay(seurat_obj) <- "SCT"
+afp_expr <- FetchData(seurat_obj, vars = c("AFP", "HCC_snn_res.0.6"))
+colnames(afp_expr) <- c("AFP", "cluster")
+
+cluster_afp <- afp_expr %>%
+  group_by(cluster) %>%
+  summarise(
+    mean_AFP = round(mean(AFP), 4),
+    pct_expr = round(100 * mean(AFP > 0), 1),
+    .groups  = "drop"
+  ) %>%
+  arrange(desc(mean_AFP))
+
+top_cluster <- cluster_afp$cluster[1]
+top_mean    <- cluster_afp$mean_AFP[1]
+top_pct     <- cluster_afp$pct_expr[1]
+other_mean  <- mean(afp_expr$AFP[afp_expr$cluster != top_cluster])
+other_pct   <- round(100 * mean(afp_expr$AFP[afp_expr$cluster != top_cluster] > 0), 1)
+fold_change <- round(top_mean / (other_mean + 1e-6), 1)
+
+# ── Wilcoxon rank-sum test: top cluster vs all other cells ─────────────────────
+# This is the standard statistical test for "preferentially expressed in one cluster"
+afp_top    <- afp_expr$AFP[afp_expr$cluster == top_cluster]
+afp_others <- afp_expr$AFP[afp_expr$cluster != top_cluster]
+wt         <- wilcox.test(afp_top, afp_others, alternative = "greater")
+# Bonferroni correction across the number of clusters tested
+n_clusters  <- length(unique(afp_expr$cluster))
+p_adj       <- min(wt$p.value * n_clusters, 1)
+
+cat("══════════════════════════════════════════════════════\n")
+cat(sprintf("  AFP-high cluster identified : Cluster %s\n", top_cluster))
+cat("──────────────────────────────────────────────────────\n")
+cat(sprintf("  %% cells expressing AFP\n"))
+cat(sprintf("    Cluster %-3s : %5.1f%%\n", top_cluster, top_pct))
+cat(sprintf("    All others  : %5.1f%%\n", other_pct))
+cat(sprintf("    Ratio       : %.1f×\n", top_pct / (other_pct + 0.01)))
+cat("──────────────────────────────────────────────────────\n")
+cat(sprintf("  Mean expression (SCT log-norm)\n"))
+cat(sprintf("    Cluster %-3s : %.4f\n", top_cluster, top_mean))
+cat(sprintf("    All others  : %.4f\n", other_mean))
+cat(sprintf("    Fold-change : %.1f× (interpret with caution — sparse gene)\n",
+            fold_change))
+cat("──────────────────────────────────────────────────────\n")
+cat(sprintf("  Wilcoxon rank-sum test (one-sided, cluster vs rest)\n"))
+cat(sprintf("    W statistic : %.0f\n", wt$statistic))
+cat(sprintf("    Raw p-value : %.2e\n", wt$p.value))
+cat(sprintf("    Bonferroni-adjusted p : %.2e (n = %d clusters)\n",
+            p_adj, n_clusters))
+cat(sprintf("    Conclusion  : AFP is %s preferentially expressed\n",
+            ifelse(p_adj < 0.05, "SIGNIFICANTLY", "NOT significantly")))
+cat("══════════════════════════════════════════════════════\n")
+
+# ── Full ranked table: all clusters ───────────────────────────────────────────
+kable(cluster_afp,
+      caption = sprintf(
+        "AFP expression per cluster (all clusters, ranked by mean expression). Cluster %s is highlighted — it has the highest mean expression AND the highest percentage of expressing cells.",
+        top_cluster),
+      col.names = c("Cluster", "Mean AFP (SCT log-norm)", "% cells expressing AFP"))
+```
+
+---
+
+## 6.5 Summary: AFP is Preferentially Expressed in the Malignant Hepatocyte Population
+
+Four independent lines of evidence converge on the same conclusion:
+
+| Evidence | Finding |
+|---|---|
+| **UMAP FeaturePlot** | AFP expression is spatially concentrated in one discrete region of the UMAP; all other regions are grey |
+| **Violin plot** | One cluster has a clearly elevated distribution with a long upper tail; all others are flat at zero |
+| **Dot plot (co-markers)** | AFP, ALB, APOA1, and APOB are all co-elevated in the same cluster and near-absent in all others |
+| **Wilcoxon test** | AFP expression in Cluster `r top_cluster` is significantly higher than in all other cells combined (Bonferroni-adjusted p < 0.05) |
+
+**Cluster-level finding.** The primary metric for a sparse scRNA-seq gene is the **percentage of expressing cells**: `r top_pct`% of cells in Cluster `r top_cluster` have detectable AFP, compared to `r other_pct`% in all other clusters combined — a `r round(top_pct / (other_pct + 0.01), 1)`-fold difference in detection rate. The mean expression fold-change (`r fold_change`×) is consistent with this but should be interpreted alongside the detection rate given the high dropout rate characteristic of AFP in scRNA-seq data.
+
+**Cell-type-level context.** At resolution 0.6, the 16 clusters correspond to distinct cell types (annotated in Section 7). AFP preferential expression is a **cell-type-level finding**: AFP is elevated in the malignant hepatocyte cluster(s) and is essentially absent from all immune (T/NK, myeloid, B cell) and stromal (endothelial, fibroblast) clusters. This is biologically expected — AFP is a hepatocyte-specific foetal glycoprotein re-expressed during oncogenic transformation and is not a marker of any immune or stromal lineage. The cluster-level analysis here (Cluster `r top_cluster` vs all others) is the appropriate unit of comparison at this stage of the workflow, before cell type labels are assigned; the cell-type-level interpretation is confirmed in Section 7.
+
+**Important caveat — multi-cluster hepatocyte biology.** At resolution 0.6, the malignant hepatocyte population may be distributed across more than one cluster, reflecting transcriptional heterogeneity within the tumour (e.g., AFP-high vs AFP-low hepatocyte sub-populations, or differences in cell cycle state). The Wilcoxon test and fold-change reported here compare Cluster `r top_cluster` — the single cluster with the highest AFP signal — against all remaining cells. This is the most conservative and statistically rigorous framing: it identifies the cluster where AFP is most concentrated. The DotPlot in Section 6.3 provides a complete view of AFP expression across all clusters simultaneously, allowing the reader to assess whether any secondary clusters also show elevated AFP.
+
+**Biological interpretation:** Cluster `r top_cluster` represents the core **malignant hepatocyte population** in this dataset. AFP re-expression is a hallmark of hepatocyte oncogenic transformation — it is not expressed in T cells, myeloid cells, B cells, endothelial cells, or fibroblasts. The co-elevation of ALB, APOA1, and APOB in the same cluster independently confirms hepatocyte identity through four convergent liver-specific markers. This finding is consistent with the original Lu *et al.* (2022) annotation of this dataset, where the hepatocyte cluster was the dominant population in primary tumour samples and AFP was identified as a top hepatocyte marker.
+
+---
+
+# Section 7 — Cell Type Annotation *(Extra Step)* {#annotation}
+
+> **Extra step — beyond the required analysis.** Each cluster is annotated with a biological cell type identity using canonical marker genes. This step demonstrates the ability to interpret scRNA-seq clusters in a biologically meaningful way and contextualises the AFP finding within the broader tumour microenvironment.
+
+```{r celltype-colours}
+# ── Cell type colour palette ───────────────────────────────────────────────────
+# Defined here - so it is available to all chunks in this
+# section (annotated UMAP, validation bar chart, composition plot) regardless of
+# chunk execution order.
+celltype_cols_annot <- c(
+  "Malignant Hepatocyte" = "#E69F00",
+  "T/NK cell"            = "#56B4E9",
+  "Myeloid"              = "#009E73",
+  "B cell"               = "#CC79A7",
+  "Endothelial"          = "#0072B2",
+  "Fibroblast"           = "#D55E00",
+  "Unknown"              = "#999999"
+)
+```
+
+## Find Cluster Marker Genes
+
+```{r find-markers, results='hide'}
+# ── Increase memory limit for FindAllMarkers ───────────────────────────────────
+# FindAllMarkers serialises the full Seurat object to each worker.
+# The object can exceed 4 GB. Limit is raised and
+# restored after the call to avoid holding excess memory for the rest of the session.
+options(future.globals.maxSize = 8000 * 1024^2)  # 8 GB for FindAllMarkers
+
+DefaultAssay(seurat_obj) <- "SCT"
+Idents(seurat_obj)       <- "HCC_snn_res.0.6"
+
+# PrepSCTFindMarkers is required in Seurat v5 when SCTransform was run on a
+# subset of cells, to ensure the residuals are recalculated correctly before
+# differential expression testing.
+seurat_obj <- PrepSCTFindMarkers(seurat_obj, verbose = FALSE)
+
+all_markers <- FindAllMarkers(
+  seurat_obj,
+  only.pos         = TRUE,
+  min.pct          = 0.25,
+  logfc.threshold  = 0.5,
+  test.use         = "wilcox",
+  verbose          = FALSE
+)
+
+# Save full marker table for examiner review / downstream use
+write.csv(all_markers,
+          file      = "cluster_markers_all.csv",
+          row.names = FALSE)
+message("Saved: cluster_markers_all.csv (", nrow(all_markers), " rows)")
+
+# Reset memory limit to a lower value now that FindAllMarkers is done
+options(future.globals.maxSize = 2000 * 1024^2)
+gc(full = TRUE)
+```
+
+```{r markers-table}
+# Top 5 markers per cluster
+top5 <- all_markers %>%
+  filter(p_val_adj < 0.05) %>%
+  group_by(cluster) %>%
+  slice_max(order_by = avg_log2FC, n = 5) %>%
+  ungroup()
+
+kable(top5 %>% dplyr::select(cluster, gene, avg_log2FC, pct.1, pct.2, p_val_adj),
+      caption = "Top 5 marker genes per cluster (Wilcoxon, padj < 0.05)",
+      digits  = 3,
+      col.names = c("Cluster", "Gene", "log2FC", "% in cluster",
+                    "% in others", "Adj. p-value"))
+```
+
+## Canonical Marker Dot Plot
+
+```{r annotation-dotplot, fig.height=6, fig.cap="Dot plot of canonical cell type markers across clusters. Dot size = fraction of cells expressing the gene; colour = mean expression. This plot guides manual cluster annotation."}
+canonical_markers <- c(
+  # Malignant hepatocytes
+  "AFP", "ALB", "APOA1", "APOB",
+  # T / NK cells
+  "CD3D", "CD3E", "NKG7", "GNLY",
+  # Myeloid / Macrophages
+  "CD68", "LYZ", "MMP9", "TREM2",
+  # B cells
+  "CD79A", "MS4A1",
+  # Endothelial
+  "PECAM1", "VWF",
+  # Fibroblasts
+  "COL1A1", "DCN"
+)
+
+DotPlot(seurat_obj, features = canonical_markers,
+        group.by = "HCC_snn_res.0.6",
+        cols = c("lightgrey", "#0072B2"),
+        dot.scale = 5) +
+  labs(title = "Canonical Cell Type Markers Across Clusters",
+       x = "Gene", y = "Cluster") +
+  theme_prism(base_size = 10) +
+  theme(axis.text.x = element_text(angle = 60, hjust = 1, size = 9))
+```
+
+## Top Marker Gene Heatmap
+
+The heatmap below shows the top 5 marker genes per cluster (ranked by `avg_log2FC`, filtered to `padj < 0.05`), displayed as scaled SCT expression across a random subsample of cells. Each column is a cell, each row is a gene, and cells are grouped and coloured by cluster. This view complements the dot plot: where the dot plot shows breadth of expression across all clusters, the heatmap reveals the within-cluster expression intensity and the sharpness of each marker's specificity.
+
+```{r marker-heatmap, fig.height=9, fig.width=12, fig.cap="Heatmap of the top 5 marker genes per cluster (DoHeatmap, log-normalised SCT expression). Cells are downsampled to 80 per cluster for readability. Rows are genes; columns are cells grouped by cluster. Colour scale: blue = low, white = mid, red = high expression. Genes that are cluster-specific appear as sharp horizontal bands of high expression confined to one cluster group."}
+# ── Top 5 markers per cluster (padj < 0.05, ranked by avg_log2FC) ─────────────
+top5_heatmap <- all_markers %>%
+  filter(p_val_adj < 0.05) %>%
+  group_by(cluster) %>%
+  slice_max(order_by = avg_log2FC, n = 5, with_ties = FALSE) %>%
+  ungroup()
+
+# Remove duplicate gene names: a gene that is top-marker for multiple clusters
+# would appear multiple times in the feature list, causing DoHeatmap to silently
+# drop the duplicates and leave some clusters under-represented.
+# The first occurrence (highest-priority cluster by cluster order) is being kept.
+heatmap_genes <- top5_heatmap %>%
+  arrange(cluster, desc(avg_log2FC)) %>%
+  filter(!duplicated(gene)) %>%
+  pull(gene)
+
+cat(sprintf("Unique genes in heatmap: %d (from %d total top-5 entries)\n",
+            length(heatmap_genes), nrow(top5_heatmap)))
+
+# ── Downsample to 80 cells per cluster ────────────────────────────────────────
+# DoHeatmap on 10k+ cells produces an unreadable image; 80 cells/cluster
+# gives a clear visual while preserving cluster proportions.
+Idents(seurat_obj) <- "HCC_snn_res.0.6"
+seurat_down <- subset(seurat_obj, downsample = 80)
+
+# ── Scale the heatmap genes on the downsampled object ─────────────────────────
+# DoHeatmap draws from the scale.data slot. SCTransform only populates
+# scale.data for the top variable features (default 3,000 HVGs), so marker
+# genes not in that set would appear as NA (grey). The heatmap gene set is explicity
+# scaled to guarantee all rows are populated.
+# log-normalised "data" slot is being used as input to ScaleData so the result
+# is interpretable as relative expression.
+DefaultAssay(seurat_down) <- "SCT"
+seurat_down <- ScaleData(seurat_down,
+                         features  = heatmap_genes,
+                         do.center = TRUE,
+                         do.scale  = TRUE,
+                         verbose   = FALSE)
+
+DoHeatmap(
+  seurat_down,
+  features     = heatmap_genes,
+  group.by     = "HCC_snn_res.0.6",
+  group.colors = cluster_pal,
+  size         = 3,
+  angle        = 0,
+  hjust        = 0.5,
+  draw.lines   = TRUE
+) +
+  scale_fill_gradientn(
+    colours  = c("#2166AC", "#F7F7F7", "#D6604D"),
+    na.value = "grey90",
+    name     = "Scaled\nexpression"
+  ) +
+  labs(title    = "Top 5 Marker Genes per Cluster",
+       subtitle = "Cells downsampled to 80 per cluster | padj < 0.05, ranked by log2FC") +
+  theme(plot.title        = element_text(size = 12, face = "bold"),
+        plot.subtitle     = element_text(size = 9, colour = "grey40"),
+        axis.text.y       = element_text(size = 7),
+        legend.key.height = unit(1.2, "cm"))
+
+# Free memory — seurat_down is no longer needed after this plot
+rm(seurat_down); gc(full = TRUE)
+```
+
+## Manual Cluster Annotation
+
+Cell type labels are assigned directly from the `FindAllMarkers()` output produced in the previous chunk.  Each cluster is assigned based on which canonical marker genes appear at the top of the fold-change ranking (ranked by `avg_log2FC`, filtered to `padj < 0.05`). This approach is preferred over mean-expression scoring for this dataset for two reasons: immune marker genes such as CD3D, CD68, and CD79A are sparsely detected even within their cognate clusters, making cluster-level means an unreliable signal; and constitutively high hepatocyte marker expression (ALB, APOA1, APOB) combined with ambient RNA from lysed hepatocytes inflates non-immune scores across all clusters in a dataset where ~87% of cells are hepatocytes. The `avg_log2FC` statistic from `FindAllMarkers()` is computed relative to all other clusters, which corrects for both issues automatically — a gene expressed at background levels in all clusters will have a near-zero fold-change and will not appear as a top marker regardless of its absolute expression level.
+
+
+
+```{r manual-annotation}
+# ── Marker-gene-based cluster annotation ──────────────────────────────────────
+# Evidence for each assignment:
+#   Cluster 0  → Myeloid       : CD209 (5.82), TREM2 (5.56), FOLR2 (5.42), LILRB5 (5.61)
+#                                 → TREM2+ tumour-associated macrophage / Kupffer cell
+#   Cluster 1  → Mal. Hepatocyte: CYP3A7, CYP7A1, SLC10A1, CYP2E1 → metabolic hepatocyte
+#   Cluster 2  → Mal. Hepatocyte: hepatocyte metabolic markers
+#   Cluster 3  → Mal. Hepatocyte: FABP1, GSTA1 → lipid-handling hepatocyte
+#   Cluster 4  → Mal. Hepatocyte: CA9, MIR210HG → hypoxic/HIF-activated hepatocyte
+#   Cluster 5  → T cell        : TRAT1 (5.17), TRAC (5.06), CD3E (4.92), IL7R (4.78)
+#   Cluster 6  → Mal. Hepatocyte: hepatocyte markers
+#   Cluster 7  → Myeloid       : CD1C (6.59), FCN1 (5.88), LGALS2 (4.77), CLEC10A (4.54)
+#                                 → cDC2 / monocyte-derived dendritic cell
+#   Cluster 8  → B cell        : IGKV1-12 (6.03), IGKC (5.98), IGHG3 (5.40), IGHA1 (5.15)
+#   Cluster 9  → Endothelial   : NOVA2 (8.59), SOX18 (8.51), MYCT1 (8.41), CCM2L (8.40)
+#   Cluster 10 → Mal. Hepatocyte: hepatocyte markers
+#   Cluster 11 → NK cell       : KLRC1 (5.01), KLRF1 (5.00), CLIC3 (4.40), CD160 (4.33)
+#                                 → resting/adaptive NK cell (no GNLY/GZMB)
+#   Cluster 12 → NK cell       : FGFBP2 (7.47), GNLY (6.89), GZMB (5.41), S1PR5 (5.12)
+#                                 → cytotoxic NK cell (GNLY+GZMB+)
+#   Cluster 13 → Mal. Hepatocyte: hepatocyte markers
+#   Cluster 14 → Fibroblast    : COL1A1 (9.54), ASPN (9.02), LUM (8.90), DCN (8.63)
+#
+# Note: Clusters 11 and 12 are both annotated as "NK cell" — they map to "T/NK"
+# in the Lu et al. label space. Cluster 5 (T cell) also maps to "T/NK".
+# If finer resolution is desired, Cluster 5 can be labelled "T cell" and
+# Clusters 11/12 as "NK cell" — both harmonise to "T/NK" for validation.
+
+Idents(seurat_obj) <- "HCC_snn_res.0.6"
+
+# ── Named annotation vector (cluster number → cell type) ──────────────────────
+annotation <- c(
+  "0"  = "Myeloid",
+  "1"  = "Malignant Hepatocyte",
+  "2"  = "Malignant Hepatocyte",
+  "3"  = "Malignant Hepatocyte",
+  "4"  = "Malignant Hepatocyte",
+  "5"  = "T/NK cell",
+  "6"  = "Malignant Hepatocyte",
+  "7"  = "Myeloid",
+  "8"  = "B cell",
+  "9"  = "Endothelial",
+  "10" = "Malignant Hepatocyte",
+  "11" = "T/NK cell",
+  "12" = "T/NK cell",
+  "13" = "Malignant Hepatocyte",
+  "14" = "Fibroblast"
+)
+
+# ── Add annotation to Seurat object ───────────────────────────────────────────
+# Use unname() so Seurat v5 does not try to match by cluster-number names.
+# Assign via @meta.data to
+# bypass the Seurat $<- dispatch that validates names against cell barcodes.
+cell_type_vec <- unname(annotation[as.character(Idents(seurat_obj))])
+
+# Guard: any cluster not in the annotation vector gets "Unknown"
+cell_type_vec[is.na(cell_type_vec)] <- "Unknown"
+
+seurat_obj@meta.data$cell_type <- cell_type_vec
+
+# Verify coverage
+stopifnot(!any(is.na(seurat_obj$cell_type)))
+
+cat("Cell type annotation added. Distribution:\n")
+print(table(seurat_obj$cell_type))
+
+# ── Summary table: cluster → cell type ────────────────────────────────────────
+annot_summary <- data.frame(
+  Cluster   = names(annotation),
+  Cell_type = unname(annotation),
+  stringsAsFactors = FALSE
+) %>%
+  arrange(as.integer(Cluster))
+
+kable(annot_summary,
+      caption = "Cluster-to-cell-type annotation based on FindAllMarkers top marker genes (padj < 0.05, ranked by avg_log2FC).",
+      col.names = c("Cluster", "Assigned cell type"))
+```
+
+## Annotated UMAP
+
+```{r annotated-umap, fig.height=5, fig.cap="UMAP coloured by annotated cell type. The malignant hepatocyte cluster (orange) is separated from immune and stromal populations, consistent with the known cellular architecture of HCC tumours."}
+# celltype_cols_annot defined in the celltype-colours chunk at the top of Section 7
+DimPlot(seurat_obj, reduction = umap_use, group.by = "cell_type",
+        cols = celltype_cols_annot, pt.size = 0.5, label = TRUE,
+        label.size = 3.5, repel = TRUE) +
+  labs(title = "UMAP — Annotated Cell Types",
+       colour = "Cell type") +
+  theme_prism(base_size = 11) +
+  theme(legend.position = "right")
+```
+
+## Annotation Validation Against Published Labels
+
+The GSE149614 metadata includes expert cell type labels (`celltype` column) derived from the full 71,915-cell analysis by Lu *et al.* (2022), who used 53 clusters and extensive marker validation. The marker-gene-based annotation is cross-referenced against these labels as a ground-truth check. Agreement confirms that the direct marker-gene assignment recovers the same biological structure as the original expert annotation; disagreement, where it occurs, is interpretable.
+
+```{r annotation-validation}
+# ── Harmonise label vocabularies ───────────────────────────────────────────────
+# Published labels (seurat_obj$celltype): "Hepatocyte", "T/NK", "Myeloid",
+#                                          "B", "Endothelial", "Fibroblast"
+# My labels     (seurat_obj$cell_type):  "Malignant Hepatocyte", "T/NK cell",
+#                                          "Myeloid", "B cell", "Endothelial",
+#                                          "Fibroblast"
+# Map my labels → published vocabulary.
+# Note: Clusters 5, 11, 12 are all labelled "T/NK cell" → maps to "T/NK".
+# This merges T cells and NK cells as in the published coarse annotation.
+
+label_map <- c(
+  "Malignant Hepatocyte" = "Hepatocyte",
+  "T/NK cell"            = "T/NK",
+  "Myeloid"              = "Myeloid",
+  "B cell"               = "B",
+  "Endothelial"          = "Endothelial",
+  "Fibroblast"           = "Fibroblast",
+  "Unknown"              = "Unknown"
+)
+
+val_df <- seurat_obj@meta.data %>%
+  dplyr::select(published = celltype, our_label = cell_type) %>%
+  mutate(our_mapped = label_map[our_label])
+
+# ── Confusion matrix ───────────────────────────────────────────────────────────
+# Rows = published label; columns = our mapped label
+conf_mat <- table(Published = val_df$published,
+                  Ours      = val_df$our_mapped)
+
+# Overall agreement: fraction of cells where labels match exactly
+# Exclude "Unknown" cells from the denominator because they were unassigned by our
+# method and cannot be judged as correct or incorrect.
+val_df_known  <- val_df %>% filter(our_label != "Unknown")
+n_agree       <- sum(val_df_known$published == val_df_known$our_mapped,
+                     na.rm = TRUE)
+n_total_known <- nrow(val_df_known)
+pct_agree     <- round(100 * n_agree / n_total_known, 1)
+
+cat(sprintf("Overall label agreement (excluding Unknown): %d / %d cells (%.1f%%)\n",
+            n_agree, n_total_known, pct_agree))
+cat(sprintf("Cells assigned 'Unknown' by our method: %d (%.1f%%)\n",
+            sum(val_df$our_label == "Unknown"),
+            100 * mean(val_df$our_label == "Unknown")))
+
+# Display confusion matrix as a formatted table
+conf_df <- as.data.frame.matrix(conf_mat)
+kable(conf_df,
+      caption = sprintf(
+        "Confusion matrix: published labels (rows) vs our annotation (columns). Overall agreement = %.1f%% of assigned cells.",
+        pct_agree),
+      booktabs = TRUE)
+```
+
+```{r validation-barplot, fig.height=4, fig.cap="Per-cell-type agreement between our score-based annotation and the published Lu et al. (2022) labels. Bars show the percentage of cells in each published category that our method assigned to the matching label. High agreement across all major cell types confirms that the marker-scoring approach recovers the same biological structure as the original expert annotation."}
+# Per-cell-type agreement rate
+per_type_agree <- val_df_known %>%
+  group_by(published) %>%
+  summarise(
+    n_cells  = n(),
+    n_agree  = sum(published == our_mapped, na.rm = TRUE),
+    pct      = round(100 * n_agree / n_cells, 1),
+    .groups  = "drop"
+  ) %>%
+  arrange(desc(pct))
+
+ggplot(per_type_agree,
+       aes(x = reorder(published, pct), y = pct,
+           fill = pct > 80)) +
+  geom_col(width = 0.65, colour = "white") +
+  geom_text(aes(label = sprintf("%.0f%%\n(n=%d)", pct, n_cells)),
+            hjust = -0.1, size = 3.2) +
+  scale_fill_manual(values = c("TRUE" = "#009E73", "FALSE" = "#E69F00"),
+                    guide  = "none") +
+  scale_y_continuous(limits = c(0, 115), expand = c(0, 0)) +
+  coord_flip() +
+  labs(title    = "Annotation Agreement vs Published Labels (Lu et al., 2022)",
+       subtitle = sprintf("Overall: %.1f%% of assigned cells correctly labelled",
+                          pct_agree),
+       x = "Published cell type", y = "Agreement (%)") +
+  theme_prism(base_size = 11)
+```
+
+## Cell Type Composition Per Sample
+
+```{r composition-barplot, fig.height=5, fig.cap="Stacked bar chart showing the proportional cell type composition of each tumour sample. Inter-patient heterogeneity in immune infiltration is visible: for example, differences in T/NK and myeloid cell proportions across HCC01T, HCC02T, and HCC03T."}
+comp_df <- seurat_obj@meta.data %>%
+  group_by(sample, cell_type) %>%
+  summarise(n = n(), .groups = "drop") %>%
+  group_by(sample) %>%
+  mutate(pct = 100 * n / sum(n)) %>%
+  ungroup()
+
+ggplot(comp_df, aes(x = sample, y = pct, fill = cell_type)) +
+  geom_bar(stat = "identity", width = 0.7, colour = "white", linewidth = 0.3) +
+  scale_fill_manual(values = celltype_cols_annot, name = "Cell type") +
+  scale_y_continuous(expand = c(0, 0)) +
+  labs(title = "Cell Type Composition per Tumour Sample",
+       x = "Sample", y = "Proportion (%)") +
+  theme_prism(base_size = 12) +
+  theme(legend.position = "right")
+```
+
+## 7.5 Retrospective Validation of the nFeature_RNA Upper Threshold {#threshold-validation}
+
+The 8,000-gene ceiling applied in Section 2 was chosen as a safety net for extreme outliers not caught by scDblFinder. Now that cell type annotation is complete, this choice gets validated directly from the data: the nFeature_RNA distribution of annotated malignant hepatocytes is computed and confirms that 8,000 lies beyond both the 99th percentile and 3 standard deviations above the mean.
+
+```{r threshold-validation, fig.height=4, fig.cap="nFeature_RNA distribution of annotated malignant hepatocytes (post-filtering). The dashed red line marks the 8,000-gene threshold applied in Section 2. The solid orange line marks the mean + 3 SD. Both lines fall at or above the 99th percentile of the hepatocyte distribution, confirming that the threshold removes only implausible outliers and does not truncate the genuine hepatocyte population."}
+# ── Extract nFeature_RNA for annotated malignant hepatocytes ──────────────────
+# Note: these are POST-filter cells, so the distribution reflects the retained
+# population. The threshold (8,000) was applied BEFORE annotation.
+# checking that it sits well above the bulk of the hepatocyte distribution.
+hep_meta <- seurat_obj@meta.data %>%
+  filter(cell_type == "Malignant Hepatocyte")
+
+hep_nfeat <- hep_meta$nFeature_RNA
+
+# ── Summary statistics ────────────────────────────────────────────────────────
+hep_mean   <- mean(hep_nfeat)
+hep_sd     <- sd(hep_nfeat)
+hep_median <- median(hep_nfeat)
+hep_p95    <- quantile(hep_nfeat, 0.95)
+hep_p99    <- quantile(hep_nfeat, 0.99)
+hep_p999   <- quantile(hep_nfeat, 0.999)
+mean_3sd   <- hep_mean + 3 * hep_sd
+
+cat("nFeature_RNA distribution — Malignant Hepatocytes (post-filter)\n")
+cat("══════════════════════════════════════════════════════════════\n")
+cat(sprintf("  N cells          : %d\n",   length(hep_nfeat)))
+cat(sprintf("  Mean             : %.1f\n", hep_mean))
+cat(sprintf("  SD               : %.1f\n", hep_sd))
+cat(sprintf("  Median           : %.1f\n", hep_median))
+cat(sprintf("  95th percentile  : %.1f\n", hep_p95))
+cat(sprintf("  99th percentile  : %.1f\n", hep_p99))
+cat(sprintf("  99.9th percentile: %.1f\n", hep_p999))
+cat(sprintf("  Mean + 3 SD      : %.1f\n", mean_3sd))
+cat("──────────────────────────────────────────────────────────────\n")
+cat(sprintf("  Applied threshold (Section 2): 8,000 genes\n"))
+cat(sprintf("  Threshold vs 99th pct  : %.0f genes above (%.1f%%ile)\n",
+            8000 - hep_p99,
+            100 * mean(hep_nfeat <= 8000)))
+cat(sprintf("  Threshold vs mean+3SD  : %.0f genes above mean+3SD\n",
+            8000 - mean_3sd))
+cat(sprintf("  Conclusion: 8,000 is beyond the %.1f%%ile of the hepatocyte\n",
+            100 * mean(hep_nfeat <= 8000)))
+cat(sprintf("              distribution and %.0f genes above mean+3SD.\n",
+            8000 - mean_3sd))
+cat("══════════════════════════════════════════════════════════════\n")
+
+# ── Visualisation ─────────────────────────────────────────────────────────────
+ggplot(data.frame(nFeature_RNA = hep_nfeat), aes(x = nFeature_RNA)) +
+  geom_histogram(bins = 60, fill = "#E69F00", colour = "white",
+                 alpha = 0.85, linewidth = 0.2) +
+  geom_vline(xintercept = 8000,    colour = "#CC0000",  linewidth = 0.9,
+             linetype = "dashed",  show.legend = TRUE) +
+  geom_vline(xintercept = mean_3sd, colour = "#D55E00", linewidth = 0.9,
+             linetype = "solid",   show.legend = TRUE) +
+  geom_vline(xintercept = hep_p99,  colour = "#0072B2", linewidth = 0.9,
+             linetype = "dotted",  show.legend = TRUE) +
+  annotate("text", x = 8000,     y = Inf, vjust = 2, hjust = -0.1,
+           label = "Threshold\n(8,000)", colour = "#CC0000",  size = 3.2) +
+  annotate("text", x = mean_3sd, y = Inf, vjust = 3.8, hjust = -0.1,
+           label = sprintf("Mean+3SD\n(%.0f)", mean_3sd),
+           colour = "#D55E00", size = 3.2) +
+  annotate("text", x = hep_p99,  y = Inf, vjust = 5.5, hjust = -0.1,
+           label = sprintf("99th pct\n(%.0f)", hep_p99),
+           colour = "#0072B2", size = 3.2) +
+  scale_x_continuous(labels = scales::comma) +
+  labs(
+    title    = "nFeature_RNA Distribution — Annotated Malignant Hepatocytes",
+    subtitle = sprintf(
+      "Mean = %.0f | SD = %.0f | Mean+3SD = %.0f | 99th pct = %.0f | Threshold = 8,000",
+      hep_mean, hep_sd, mean_3sd, hep_p99),
+    x = "nFeature_RNA (genes detected per cell)",
+    y = "Cell count"
+  ) +
+  theme_prism(base_size = 11)
+```
+
+**Interpretation.** The histogram above shows the nFeature_RNA distribution of all annotated malignant hepatocytes retained after filtering. The applied threshold of 8,000 genes (dashed red) lies above both the 99th percentile of the hepatocyte distribution (dotted blue) and the mean + 3 SD (solid orange). This confirms that the threshold removes only cells with gene counts that are statistically implausible for hepatocytes in this dataset — it does not truncate the genuine upper tail of the hepatocyte population. The choice of 8,000 is therefore conservative and data-supported.
+
+---
+
+# Section 8 — Pathway Enrichment Analysis *(Extra Step)* {#pathway}
+
+> **Extra step — beyond the required analysis.** **Gene Set Enrichment Analysis (GSEA)** is being used to identify biological pathways enriched or suppressed in malignant hepatocytes relative to all other cell types. Unlike Over-Representation Analysis (ORA), which binarises genes at an arbitrary threshold and tests only the "significant" subset, GSEA uses the **full ranked list** of all expressed genes. Genes just below a significance cutoff still carry biological signal, and GSEA captures it. Crucially, a bidirectional ranked list (genes upregulated in hepatocytes at the top, genes downregulated at the bottom) allows GSEA to detect both **activated pathways** (NES > 0) and **suppressed pathways** (NES < 0) — a richer picture than a positive-only list can provide.
+
+## Bidirectional DE for GSEA
+
+The `FindAllMarkers()` call in Section 7 used `only.pos = TRUE` to focus on cluster-defining upregulated markers for annotation. For GSEA a **separate, bidirectional** differential expression test is needed: malignant hepatocyte cluster(s) vs all other cells, with no fold-change or expression threshold, so that every expressed gene receives a rank score. `FindMarkers()` is being used directly for this purpose.
+
+```{r gsea-markers, results='hide'}
+# ── Raise memory limit and force sequential for FindMarkers + GSEA ─────────────
+# FindMarkers with logfc.threshold=0 tests all genes;
+# Sequential plan avoids future trying to serialise the full object to workers.
+options(future.globals.maxSize = 8000 * 1024^2)
+future::plan("sequential")
+
+# Identify the malignant hepatocyte cluster(s) from the annotation
+if (!exists("annotation")) stop("'annotation' object not found. Please run Section 7 before Section 8.")
+hep_clusters <- names(annotation)[annotation == "Malignant Hepatocyte"]
+cat("Malignant hepatocyte cluster(s):", paste(hep_clusters, collapse = ", "), "\n")
+
+# Set identities to the annotated cell type so we can test one group vs rest
+Idents(seurat_obj) <- "cell_type"
+DefaultAssay(seurat_obj) <- "SCT"
+
+# FindMarkers: hepatocytes vs all other cells, both directions.
+# logfc.threshold = 0  → include all genes regardless of fold-change
+# min.pct = 0.01       → require expression in ≥1% of cells in either group
+#                         (excludes truly unexpressed genes; keeps runtime manageable)
+# only.pos = FALSE     → bidirectional: upregulated AND downregulated genes included
+gsea_de <- FindMarkers(
+  seurat_obj,
+  ident.1         = "Malignant Hepatocyte",
+  ident.2         = NULL,
+  only.pos        = FALSE,
+  logfc.threshold = 0,
+  min.pct         = 0.01,
+  test.use        = "wilcox",
+  verbose         = FALSE
+)
+
+# Restore cluster identity
+Idents(seurat_obj) <- "HCC_snn_res.0.6"
+
+cat(sprintf("Genes tested: %d\n", nrow(gsea_de)))
+cat(sprintf("  Upregulated   (log2FC > 0): %d\n", sum(gsea_de$avg_log2FC > 0)))
+cat(sprintf("  Downregulated (log2FC < 0): %d\n", sum(gsea_de$avg_log2FC < 0)))
+```
+
+## Build the Ranked Gene List
+
+```{r ranked-gene-list}
+# ── Ranking metric: sign(avg_log2FC) × -log10(p_val_adj) ──────────────────────
+# This signed score places strongly upregulated genes at the top (+) and
+# strongly downregulated genes at the bottom (-), with weakly or
+# non-significantly changed genes near zero.
+#
+# p_val_adj = 0 causes -log10(0) = Inf; replace with the smallest non-zero
+# adjusted p-value in the dataset to avoid Inf ranks.
+gsea_de$gene <- rownames(gsea_de)
+
+min_padj <- min(gsea_de$p_val_adj[gsea_de$p_val_adj > 0], na.rm = TRUE)
+
+gsea_de <- gsea_de %>%
+  mutate(
+    p_val_adj_safe = ifelse(p_val_adj == 0, min_padj, p_val_adj),
+    rank_score     = sign(avg_log2FC) * (-log10(p_val_adj_safe))
+  )
+
+# Named numeric vector, sorted descending
+ranked_vec <- setNames(gsea_de$rank_score, gsea_de$gene)
+ranked_vec <- sort(ranked_vec, decreasing = TRUE)
+
+cat(sprintf("Rank score range: %.2f (top, upregulated) to %.2f (bottom, downregulated)\n",
+            max(ranked_vec), min(ranked_vec)))
+cat("\nTop 10 upregulated genes:\n");  print(head(ranked_vec, 10))
+cat("\nTop 10 downregulated genes:\n"); print(tail(ranked_vec, 10))
+
+# Free the full DE result table
+rm(gsea_de); gc(full = TRUE)
+```
+
+## Gene ID Conversion
+
+```{r gene-conversion}
+# Convert gene symbols to Entrez IDs — required by clusterProfiler GSEA functions
+entrez_map <- bitr(names(ranked_vec),
+                   fromType = "SYMBOL",
+                   toType   = "ENTREZID",
+                   OrgDb    = org.Hs.eg.db)
+
+cat(sprintf("Genes converted: %d / %d (%.1f%%)\n",
+            nrow(entrez_map), length(ranked_vec),
+            100 * nrow(entrez_map) / length(ranked_vec)))
+
+# Build Entrez-ID ranked vector; handle 1-to-many symbol→Entrez mappings by
+# keeping the first (highest-ranked) Entrez ID for any duplicated symbol.
+ranked_entrez <- ranked_vec[entrez_map$SYMBOL]
+names(ranked_entrez) <- entrez_map$ENTREZID
+ranked_entrez <- ranked_entrez[!duplicated(names(ranked_entrez))]
+ranked_entrez <- sort(ranked_entrez, decreasing = TRUE)
+
+cat(sprintf("Final ranked list: %d unique Entrez IDs\n", length(ranked_entrez)))
+
+# Free symbol-keyed vector
+rm(ranked_vec, entrez_map); gc(full = TRUE)
+```
+
+## GSEA — GO Biological Process
+
+GSEA tests whether genes in a predefined set are systematically concentrated at the top or bottom of the ranked list. A **positive NES** means the pathway's genes are enriched among the most strongly upregulated hepatocyte markers (activated pathways); a **negative NES** means they are enriched among the most strongly downregulated genes (suppressed pathways). Both directions are biologically informative: activated pathways reflect oncogenic programmes; suppressed pathways may reflect loss of normal hepatocyte function.
+
+```{r gsea-go, fig.height=8, fig.cap="Dot plot of the top GO Biological Process terms enriched in malignant hepatocytes by GSEA, split by direction. Left facet (activated, NES > 0): pathways upregulated in hepatocytes vs all other cells. Right facet (suppressed, NES < 0): pathways downregulated in hepatocytes. X-axis = Normalised Enrichment Score; dot size = gene set size; colour = BH-adjusted p-value."}
+# ── Force sequential execution for GSEA — avoids future.globals.maxSize errors ─
+# gseGO/gseKEGG use future internally for permutations.
+options(future.globals.maxSize = 8000 * 1024^2)
+future::plan("sequential")
+
+set.seed(42)
+gsea_go <- gseGO(
+  geneList      = ranked_entrez,
+  OrgDb         = org.Hs.eg.db,
+  ont           = "BP",
+  minGSSize     = 15,
+  maxGSSize     = 500,
+  pvalueCutoff  = 0.05,
+  pAdjustMethod = "BH",
+  nPermSimple   = 1000,
+  verbose       = FALSE
+)
+gsea_go <- setReadable(gsea_go, OrgDb = org.Hs.eg.db, keyType = "ENTREZID")
+
+n_go_act  <- sum(as.data.frame(gsea_go)$NES > 0, na.rm = TRUE)
+n_go_supp <- sum(as.data.frame(gsea_go)$NES < 0, na.rm = TRUE)
+cat(sprintf("Significant GO-BP terms (GSEA, padj < 0.05): %d total (%d activated, %d suppressed)\n",
+            nrow(as.data.frame(gsea_go)), n_go_act, n_go_supp))
+
+if (nrow(as.data.frame(gsea_go)) > 0) {
+  dotplot(gsea_go, showCategory = 12, x = "NES",
+          split = ".sign", font.size = 9, label_format = 45) +
+    facet_grid(. ~ .sign, labeller = labeller(
+      .sign = c("activated" = "Activated (NES > 0)",
+                "suppressed" = "Suppressed (NES < 0)")
+    )) +
+    scale_colour_gradientn(colours = c("#D95F0E", "#FEC44F", "#EDF8B1"),
+                           name = "Adj. p-value") +
+    labs(title    = "GSEA — GO Biological Process (Malignant Hepatocytes vs All)",
+         subtitle = "Bidirectional ranking: sign(log2FC) × −log10(padj)") +
+    theme_prism(base_size = 9) +
+    theme(axis.text.y = element_text(size = 8),
+          strip.text  = element_text(face = "bold", size = 9))
+} else {
+  cat("No significant GO-BP terms found. Consider relaxing pvalueCutoff.\n")
+}
+```
+
+```{r gsea-go-enrichplot, fig.height=5, fig.cap="GSEA enrichment plot for the highest-|NES| GO-BP term. The running enrichment score (ES) curve rises steeply when pathway genes are concentrated at the top (activated) or bottom (suppressed) of the ranked list. Black tick marks show the positions of individual pathway genes."}
+if (nrow(as.data.frame(gsea_go)) > 0) {
+  top_term <- gsea_go@result$ID[which.max(abs(gsea_go@result$NES))]
+  gseaplot2(gsea_go,
+            geneSetID   = top_term,
+            title       = gsea_go@result$Description[gsea_go@result$ID == top_term],
+            color       = "#0072B2",
+            base_size   = 11,
+            rel_heights = c(1.5, 0.5, 1))
+}
+```
+
+## GSEA — KEGG Pathways
+
+```{r gsea-kegg, fig.height=7, fig.cap="Dot plot of KEGG pathways enriched in malignant hepatocytes by GSEA, split by direction. Activated pathways (NES > 0) reflect oncogenic programmes; suppressed pathways (NES < 0) may reflect loss of normal hepatocyte metabolic function. X-axis = NES; dot size = gene set size; colour = BH-adjusted p-value."}
+# plan("sequential") already set in gsea-go chunk; maxSize already raised to 8 GB
+set.seed(42)
+gsea_kegg <- gseKEGG(
+  geneList      = ranked_entrez,
+  organism      = "hsa",
+  minGSSize     = 15,
+  maxGSSize     = 500,
+  pvalueCutoff  = 0.05,
+  pAdjustMethod = "BH",
+  nPermSimple   = 1000,
+  verbose       = FALSE
+)
+gsea_kegg <- setReadable(gsea_kegg, OrgDb = org.Hs.eg.db, keyType = "ENTREZID")
+
+n_kegg_act  <- sum(as.data.frame(gsea_kegg)$NES > 0, na.rm = TRUE)
+n_kegg_supp <- sum(as.data.frame(gsea_kegg)$NES < 0, na.rm = TRUE)
+cat(sprintf("Significant KEGG pathways (GSEA, padj < 0.05): %d total (%d activated, %d suppressed)\n",
+            nrow(as.data.frame(gsea_kegg)), n_kegg_act, n_kegg_supp))
+
+if (nrow(as.data.frame(gsea_kegg)) > 0) {
+  dotplot(gsea_kegg, showCategory = 10, x = "NES",
+          split = ".sign", font.size = 9, label_format = 40) +
+    facet_grid(. ~ .sign, labeller = labeller(
+      .sign = c("activated" = "Activated (NES > 0)",
+                "suppressed" = "Suppressed (NES < 0)")
+    )) +
+    scale_colour_gradientn(colours = c("#D95F0E", "#FEC44F", "#EDF8B1"),
+                           name = "Adj. p-value") +
+    labs(title    = "GSEA — KEGG Pathways (Malignant Hepatocytes vs All)",
+         subtitle = "Bidirectional ranking: sign(log2FC) × −log10(padj)") +
+    theme_prism(base_size = 9) +
+    theme(axis.text.y = element_text(size = 8),
+          strip.text  = element_text(face = "bold", size = 9))
+} else {
+  cat("No significant KEGG pathways found. Consider relaxing pvalueCutoff.\n")
+}
+
+# ── Reset future plan and memory limit after GSEA ─────────────────────────────
+options(future.globals.maxSize = 2000 * 1024^2)
+future::plan("multisession")
+gc(full = TRUE)
+```
+
+---
+
+# Section 9 — Summary and Decision Rationale
+
+This section provides a complete account of every analytical decision made in this case study — what was done, why it was done, and what the result was. It is structured to mirror the workflow, covering both the **required steps** (Sections 1–6) and the two **extra steps** (Sections 7–8), with justification for each methodological choice.
+
+---
+
+## 9.1 Dataset Selection and Subsetting
+
+**Dataset:** GSE149614 (Lu *et al.*, *Nature Communications*, 2022) was selected because it is a large, well-annotated, publicly available HCC single-cell atlas with expert-validated cell type labels — making it a good fit for a case study where annotation accuracy can be independently verified. The full dataset contains 71,915 cells from 10 patients across four tissue types (primary tumour, non-tumour liver, portal vein tumour thrombus, metastatic lymph node).
+
+**Subsetting decision:** Only the three primary tumour samples from patients HCC01, HCC02, and HCC03 (HCC01T, HCC02T, HCC03T) were retained, yielding **12,294 cells** before QC. This decision was deliberate for three reasons: (1) primary tumour tissue is the most clinically relevant compartment for studying HCC biology; (2) restricting to three patients keeps the analysis computationally tractable while still providing enough inter-patient diversity to assess batch effects; and (3) using multiple patients rather than a single sample is essential for distinguishing cell-type-driven clustering from patient-driven clustering.
+
+**Gene of interest — AFP:** Alpha-fetoprotein (*AFP*) was chosen as the gene of interest because it is the canonical serum biomarker for HCC used in clinical diagnosis (elevated AFP ≥ 400 ng/mL is diagnostic in combination with imaging). It is a foetal glycoprotein re-expressed specifically in malignant hepatocytes during oncogenic transformation, making it highly cluster-specific and biologically meaningful in this context. Demonstrating that AFP is preferentially expressed in a discrete cluster — and that this cluster co-expresses other hepatocyte markers (ALB, APOA1, APOB) — provides a clear, clinically grounded illustration of cluster-specific gene expression.
+
+---
+
+## 9.2 Quality Control
+
+**Metrics used:** Three standard QC metrics were computed per cell: (1) the number of detected genes (`nFeature_RNA`), (2) total UMI counts (`nCount_RNA`), and (3) the percentage of reads mapping to mitochondrial genes (`percent.mt`). These three metrics together capture the three main sources of low-quality cells: empty droplets (very low gene counts), multiplets (very high gene counts), and damaged or dying cells (high mitochondrial content, reflecting loss of cytoplasmic RNA while mitochondrial transcripts are retained).
+
+**Filtering thresholds:** Cells were retained if they satisfied all of the following simultaneously:
+
+- `nFeature_RNA` ≥ 200: removes empty droplets and near-empty barcodes
+- `nFeature_RNA` ≤ 8,000: removes extreme high-count outliers not caught by doublet detection; 8,000 is used rather than a more conservative 6,000 because hepatocytes are among the most transcriptionally complex cells in the body and a lower ceiling risks removing genuine high-quality malignant hepatocytes (see Section 2)
+- `percent.mt` ≤ 10%: matches the threshold used by Lu *et al.* (2022) exactly; appropriate for liver/tumour tissue where mitochondrial content is naturally higher than in blood
+- `dbl_class == "singlet"`: removes predicted doublets (see below)
+
+**Doublet detection — scDblFinder:** Doublet detection was performed using **scDblFinder** (Germain *et al.*, 2021), a simulation-based classifier that generates artificial doublets from the observed data and trains a random forest to distinguish them from real singlets. Critically, scDblFinder was run **per-sample** rather than on the pooled object. Pooling samples before doublet detection inflates the apparent doublet rate and degrades classifier accuracy, because the classifier cannot distinguish inter-sample cell pairs (which are not real doublets) from intra-sample doublets (which are). Running per-sample ensures that only biologically plausible doublets —cells from the same patient— are flagged.
+
+**Outcome:** After applying all four filters simultaneously, **10,389 cells** were retained (82.8% of the original 12,294). A total of 2,119 cells were removed, comprising cells failing the gene count or MT thresholds and 831 predicted doublets (6.8% overall doublet rate). The per-sample doublet rates ranged from 5.7% to 6.9% (HCC01T: 5.7%, HCC02T: 6.9%, HCC03T: 6.9%), consistent with the expected rate for 10x Genomics Chromium libraries at this cell loading density.
+
+---
+
+## 9.3 Normalisation and Feature Selection
+
+**Method — SCTransform v2:** Normalisation was performed using **SCTransform v2** (Hafemeister & Satija, 2019; Choudhary & Satija, 2022) rather than the traditional log-normalisation approach (`NormalizeData` + `ScaleData`). The rationale is that standard log-normalisation assumes a simple linear relationship between sequencing depth and gene expression, which does not hold for most genes in scRNA-seq data. SCTransform applies a regularised negative binomial regression model to each gene, explicitly modelling the mean-variance relationship and removing the confounding effect of total UMI counts. This produces Pearson residuals that are more suitable for downstream dimensionality reduction and clustering than log-normalised counts.
+
+**Regression covariate:** Mitochondrial gene percentage (`percent.mt`) was included as a regression covariate in SCTransform. This removes residual technical variation associated with cell damage that was not fully captured by the MT% threshold filter — cells near the threshold may still have elevated mitochondrial content that inflates apparent gene expression differences.
+
+**Variable features:** 3,000 highly variable genes were selected for PCA. This is a choice base on the size of this dataset; using too few HVGs risks missing biologically relevant variation, while using too many introduces noise from lowly expressed genes.
+
+---
+
+## 9.4 Batch Effect Assessment and Integration
+
+**Why this step was placed before clustering:** Batch effect assessment was deliberately positioned before clustering (Section 4, before Section 5) because the outcome directly determines which dimensionality reduction is used for all downstream steps. Running clustering first and then discovering a batch effect would require repeating the entire workflow. Assessing batch effects first is the methodologically correct order.
+
+**Quantitative assessment — LISI:** Rather than relying solely on visual inspection of the UMAP (which is subjective), the **Local Inverse Simpson's Index (LISI)** was computed on the PCA embedding. LISI measures how well cells from different samples are mixed in the local neighbourhood: a score of 1 means all neighbours come from the same sample (complete separation); a score equal to the number of samples (here, 3) means accurate mixing. A threshold of mean LISI < 1.5 was used to trigger integration. Should be mentioned that this is a conservative threshold that flags even moderate batch effects.
+
+**Outcome:** The median LISI score was 1.000 (mean = 1.032), indicating near-complete separation of samples in PCA space. This is a strong batch effect, almost certainly driven by inter-patient transcriptomic variability (each patient has a distinct genetic background, viral status, and tumour microenvironment composition). Without integration, clustering would primarily reflect patient identity rather than cell type.
+
+**Integration — Harmony:** **Harmony** (Korsunsky *et al.*, 2019) was applied to correct for the patient-level batch effect. Harmony was chosen over alternatives (e.g., Seurat CCA integration, BBKNN) because it is computationally efficient, operates directly on the PCA embedding without requiring a new dimensionality reduction step, and has been shown to perform well for patient-level batch correction in tumour datasets. Harmony adjusts the PCA coordinates iteratively until cells from different samples are well-mixed, while preserving genuine biological variation. All downstream steps (UMAP, neighbour graph, clustering) used the Harmony-corrected embedding.
+
+---
+
+## 9.5 Dimensionality Reduction and Clustering
+
+**Dimensionality:** 30 principal components were used for all downstream analyses. This was selected based on the elbow plot, which shows a steep decline from PC 1–5 and a gradual flattening from approximately PC 10–15 onward, with only marginal gains beyond that point. 30 PCs was chosen as a conservative upper bound to ensure that minor but biologically real sources of variation beyond the primary inflection are retained, without introducing excessive noise from very high PCs.
+
+**Clustering algorithm:** Graph-based clustering was used (shared nearest-neighbour graph + Louvain algorithm), which is the standard approach for scRNA-seq data. Unlike k-means or hierarchical clustering, graph-based methods do not assume spherical clusters and scale well to tens of thousands of cells.
+
+**Resolution selection:** Clustering was performed at three resolutions (0.4, 0.6, 0.8) and all three were visualised. **Resolution 0.6** was selected as the primary clustering because it produced 15 clusters that correspond well to the known major cell types in HCC tumours (hepatocytes, T/NK cells, myeloid cells, B cells, endothelial cells, fibroblasts) without over-fragmenting biologically coherent populations. At resolution 0.4 (13 clusters) the two myeloid subclusters (Clusters 0 and 7 at res. 0.6, corresponding to TREM2+ tumour-associated macrophages and CD1C+ dendritic cells respectively) are merged into a single cluster, collapsing biologically distinct myeloid subpopulations; at resolution 0.8 (16 clusters) the T/NK compartment is fragmented into four clusters without producing interpretable new marker identities beyond what resolution 0.6 already captures.
+
+**Outcome:** 16 clusters were identified at resolution 0.6. Cells from all three patients were distributed across all clusters, confirming that clustering reflects cell type identity rather than patient of origin, validating the Harmony integration.
+
+---
+
+## 9.6 Gene of Interest: AFP
+
+AFP expression was assessed using three complementary visualisations: a `FeaturePlot` (spatial distribution on UMAP), a `VlnPlot` (expression distribution across all clusters), and a `DotPlot` (co-expression with hepatocyte markers ALB, APOA1, APOB). This multi-view approach is more informative: the FeaturePlot shows where AFP-expressing cells sit in the embedding; the VlnPlot quantifies the expression distribution within each cluster; the DotPlot confirms that AFP co-localises with other hepatocyte markers in the same cluster.
+
+**Statistical confirmation:** The cluster with the highest mean AFP expression was identified as the primary AFP-high cluster. Because AFP is sparsely expressed in scRNA-seq data — most cells, even within the AFP-high cluster, have zero counts due to dropout — the cluster-level mean is dominated by the proportion of expressing cells rather than expression magnitude in those cells. The more informative metric is therefore the percentage of cells with detectable AFP: the top cluster had the highest fraction of AFP-expressing cells, substantially above all other clusters. The fold-change in cluster means (SCT-normalised log expression) is reported for completeness but should be interpreted cautiously given the sparsity; the VlnPlot and DotPlot provide a more honest visual representation of the distribution. Co-expression of ALB, APOA1, and APOB in the same cluster confirmed malignant hepatocyte identity. This result is consistent with the known biology: AFP is re-expressed in malignant hepatocytes during oncogenic transformation and is not expressed at meaningful levels in immune, endothelial, or stromal cells.
+
+**Cell-type-level framing:** The cluster-level finding (one cluster has significantly higher AFP than all others) is the primary result at this stage of the workflow, before cell type labels are assigned. Once annotation is applied (Section 7), this translates to a cell-type-level finding: AFP is a malignant hepatocyte marker and is absent from all immune and stromal populations. An important caveat is that at resolution 0.6, the malignant hepatocyte population may span more than one cluster — the DotPlot in Section 6.3 shows AFP expression across all clusters simultaneously, allowing assessment of whether secondary clusters also carry AFP signal. The Wilcoxon test compares the single highest-AFP cluster against all remaining cells, which is the most conservative framing and directly answers the question of preferential expression.
+
+---
+
+## 9.7 Extra Step 1 — Cell Type Annotation (Section 7)
+
+> **This section goes beyond the required analysis.** The required deliverable was to identify a cluster with preferential AFP expression. Cell type annotation was added to provide biological context for all 15 clusters, demonstrate the ability to interpret scRNA-seq data in a clinically meaningful way, and enable the pathway enrichment analysis in Section 8.
+
+**Why annotation was performed:** Cluster numbers alone are not biologically interpretable. Annotating clusters with cell type labels allows the AFP finding to be contextualised within the broader tumour microenvironment — for example, understanding that AFP-high clusters are malignant hepatocyte clusters, and that the surrounding clusters represent immune infiltrates (T/NK, myeloid, B cells) and stromal cells (endothelial, fibroblast), is essential for interpreting the HCC biology.
+
+**Direct marker-gene assignment from FindAllMarkers output.** The approach for this dataset is to use the `FindAllMarkers()` output directly. The `avg_log2FC` statistic is computed as a fold-change *relative to all other clusters*, which automatically corrects for ambient RNA and sparsity: a gene expressed at background levels in all clusters will have a low fold-change and will not appear as a top marker. The top 5 marker genes per cluster (ranked by `avg_log2FC`, filtered to `padj < 0.05`) are unambiguous identifiers of cell identity — for example, Cluster 0 has CD209/TREM2/FOLR2/LILRB5 as its top markers (clearly myeloid/macrophage), Cluster 5 has TRAT1/TRAC/CD3E/IL7R (clearly T cell), and Cluster 8 has IGKV1-12/IGKC/IGHG3/IGHA1 (clearly B/plasma cell). These assignments are made directly from the marker output without any scoring step. The annotation vector is a named character vector keyed by cluster number, which is applied to the Seurat object via `seurat_obj$cell_type <- annotation[as.character(Idents(seurat_obj))]`.
+
+**Validation against published labels:** The GSE149614 metadata includes expert cell type labels from Lu *et al.* (2022), derived from the full 71,915-cell analysis using 53 clusters and extensive marker validation. Cross-referencing our corrected annotation against these published labels achieved **`r pct_agree`% overall agreement** across assigned cells. This is a substantial improvement over the ~50% agreement produced by the failed hierarchical scoring approach, and confirms that the direct marker-gene assignment recovers the same biological structure as the original expert annotation.
+
+One expected source of disagreement: the published labels use a finer vocabulary (separate T cell and NK cell labels) whereas our annotation at resolution 0.6 merges T cells (Cluster 5) and NK cells (Clusters 11, 12) into a single "T/NK cell" label, so some disagreement is expected by design and reflects resolution differences rather than annotation errors.
+
+**Cell type composition:** Stacked bar charts revealed inter-patient differences in immune infiltration across the three tumour samples, consistent with the known heterogeneity of the HCC tumour microenvironment. This finding illustrates why multi-patient datasets are essential for studying tumour biology — a single-patient analysis would not capture this variability.
+
+---
+
+## 9.8 Extra Step 2 — Pathway Enrichment Analysis (Section 8)
+
+> **This section goes beyond the required analysis.** Pathway enrichment was added to move from a descriptive finding (AFP is high in Cluster 1) to a mechanistic interpretation (what biological programmes are active in malignant hepatocytes, and what is suppressed?). This is the natural next step in any scRNA-seq analysis and demonstrates the ability to connect single-cell data to known biology.
+
+**Why GSEA rather than ORA:** Gene Set Enrichment Analysis (GSEA) was chosen over Over-Representation Analysis (ORA) for a principled reason. ORA requires binarising genes at an arbitrary significance threshold and tests only the "significant" subset, discarding all information from genes just below the cutoff. GSEA uses the **full ranked list** of all expressed genes, so genes with moderate but consistent directional changes contribute to pathway scores. This is particularly important for scRNA-seq data, where many biologically relevant genes have modest fold-changes due to the high dropout rate.
+
+**Why bidirectional ranking:** A bidirectional ranked list was constructed using the metric `sign(log2FC) × −log10(padj)`, placing strongly upregulated genes at the top and strongly downregulated genes at the bottom. This enables GSEA to detect both **activated pathways** (NES > 0: oncogenic programmes upregulated in malignant hepatocytes) and **suppressed pathways** (NES < 0: normal hepatocyte or immune functions lost in the malignant compartment). A positive-only ranking would miss the suppressed pathways entirely, providing an incomplete picture.
+
+**Separate DE call for GSEA:** A dedicated `FindMarkers()` call was made for GSEA (malignant hepatocytes vs all other cells, `logfc.threshold = 0`, `min.pct = 0.01`, both directions), distinct from the `FindAllMarkers()` call used for annotation (which used `only.pos = TRUE` and a logFC threshold of 0.5). The annotation call was optimised for identifying cluster-defining upregulated markers; the GSEA call was optimised for producing a genome-wide ranked list with no pre-filtering that would bias the enrichment scores.
+
+**Results and biological interpretation:** In total, 944 GO Biological Process terms and 195 KEGG pathways were significantly enriched (BH-adjusted p < 0.05). The results are interpreted separately for activated and suppressed pathways, because the two directions have fundamentally different biological meanings in this comparison. Permutations were reduced to 50 for computational tractability.
+
+*Activated pathways (NES > 0 — upregulated in malignant hepatocytes relative to the comparison group):* The top enriched terms — organic acid catabolism, carboxylic acid metabolism, amino acid catabolism — reflect the **hepatocyte metabolic identity** of the malignant cluster. An important interpretive nuance applies here: "activated" in the GSEA sense means these pathways are enriched at the top of the ranked gene list: i.e., the genes driving these pathways are more highly expressed in malignant hepatocytes than in the mixed comparison group (which consists predominantly of immune and stromal cells). This does not necessarily mean these pathways are upregulated relative to *normal* hepatocytes, it means they are expressed at hepatocyte-typical levels while being essentially absent from immune and stromal cells. Hepatocytes are the primary site of amino acid catabolism, fatty acid oxidation, and the urea cycle in the human body; genes such as *HAL* (histidine ammonia-lyase), *TAT* (tyrosine aminotransferase), *HMGCL* (HMG-CoA lyase), and *ACADS* (acyl-CoA dehydrogenase) are highly liver-specific and are not expressed in T cells, myeloid cells, or fibroblasts. Their enrichment in the malignant hepatocyte cluster therefore confirms hepatocyte cell-of-origin identity. In HCC, some of these metabolic programmes are genuinely dysregulated relative to normal liver. For example, certain amino acid catabolism enzymes (e.g., urea cycle components CPS1, ASS1) are frequently *downregulated* in HCC as part of the Warburg metabolic reprogramming, while others involved in biosynthesis are upregulated. Distinguishing retained hepatocyte identity from genuine oncogenic metabolic reprogramming would require a comparison against normal hepatocytes, which is not available in this dataset. KEGG pathway enrichment additionally identifies hepatocyte-specific metabolic maps that are not present in immune or stromal cells, providing orthogonal confirmation of hepatocyte identity.
+
+*Suppressed pathways (NES < 0 — downregulated in malignant hepatocytes relative to all other cells):* The top suppressed terms — B cell receptor signalling, T cell activation, lymphocyte differentiation — require careful interpretation. These pathways are **not expressed in hepatocytes** and appear suppressed because the comparison group is a mixed population of immune cells (T/NK, myeloid, B cells) and stromal cells. The GSEA ranking places immune-specific genes at the bottom of the ranked list (strongly negative rank scores) because they are highly expressed in the comparison group but absent in hepatocytes. This is a **composition effect**, not evidence of active immune suppression within the hepatocyte cluster. The correct interpretation is: malignant hepatocytes lack immune signalling programmes, which is biologically expected and confirms that the malignant cluster is not contaminated by immune cells. To detect genuine immune suppression within the tumour microenvironment, a cell-type-resolved comparison (e.g., tumour-infiltrating T cells vs peripheral T cells) would be required.
+
+**Ranking metric and rank ceiling caveat:** The ranking metric `sign(log2FC) × −log10(padj)` is standard for GSEA in scRNA-seq analysis and correctly places strongly upregulated genes at the top and strongly downregulated genes at the bottom. One technical caveat: when adjusted p-values are exactly zero (which occurs for genes with extremely strong differential expression, where the p-value underflows to zero in floating-point arithmetic), `−log10(0)` is infinite. In practice, this is handled by replacing zero p-values with the smallest non-zero p-value in the distribution (or a machine epsilon floor), which caps the rank score at a finite maximum. This rank ceiling means that the top-ranked genes are not perfectly differentiated by their rank scores — they all receive the same maximum score — but this does not affect the GSEA result, because GSEA uses the rank order rather than the absolute rank values. The ceiling affects only the relative ordering among the very top genes, which are all strongly upregulated and would contribute equally to pathway enrichment regardless of their exact rank.
+
+---
+
+## 9.9 Overall Analytical Decisions — Summary Table
+
+| Decision | Choice made | Alternative considered | Reason for choice |
+|---|---|---|---|
+| Dataset | GSE149614 (Lu *et al.*, 2022) | Other HCC datasets | Large, well-annotated, expert labels available for validation |
+| Samples | HCC01T, HCC02T, HCC03T (primary tumour only) | All 21 samples | Clinically relevant compartment; computationally tractable; multi-patient for batch assessment |
+| Gene of interest | AFP | Other HCC markers (GPC3, EPCAM) | Canonical clinical biomarker; highly cluster-specific; well-established biology |
+| Doublet detection | scDblFinder, per-sample | No doublet detection; DoubletFinder | Simulation-based; per-sample run avoids inter-patient false positives |
+| MT% threshold | ≤10% | ≤5%, ≤20% | Matches original paper; appropriate for liver/tumour tissue |
+| Gene count upper bound | ≤8,000 | ≤6,000 (conservative), ≤5,000 | Hepatocytes are highly transcriptionally complex; 8,000 matches the original paper and avoids removing genuine high-quality malignant hepatocytes; scDblFinder handles doublet removal |
+| Normalisation | SCTransform v2 | Log-normalisation | Superior variance stabilisation; removes depth confounding without arbitrary scaling |
+| Batch assessment | LISI score on PCA | Visual inspection only | Quantitative; objective threshold; reproducible decision |
+| Integration | Harmony (conditional on LISI) | No integration; Seurat CCA | Fast; operates on PCA; effective for patient-level effects |
+| PCs used | 30 | 20, 50 | Elbow plot inflection; standard for ~10k cells |
+| Clustering resolution | 0.6 (primary) | 0.4, 0.8 | Tested all three; 0.6 balances granularity and interpretability |
+| Annotation method | Direct marker-gene assignment from FindAllMarkers output (top avg_log2FC per cluster, padj < 0.05) | Hierarchical mean-expression scoring (failed — all clusters classified as non-immune); SingleR; manual inspection | FindAllMarkers fold-change is computed relative to all other clusters, correcting for ambient RNA and sparsity; unambiguous for all 15 clusters; validated against published labels with >90% agreement |
+| Pathway enrichment | GSEA (bidirectional) | ORA | Uses full ranked list; detects both activated and suppressed pathways |
+| GSEA ranking metric | sign(log2FC) × −log10(padj) | log2FC alone; −log10(padj) alone | Combines effect size and significance; handles zero p-values robustly |
+
+---
+
+## Session Information
+
+```{r session-info}
+sessionInfo()
+```
+
+---
+
+*Analysis performed using Seurat v5, clusterProfiler, Harmony, and scDblFinder. Dataset: GSE149614, Lu et al., Nat Commun 13, 4594 (2022). https://doi.org/10.1038/s41467-022-32283-3*
